@@ -1,0 +1,17 @@
+{
+  "name": "Hinton Water Disinfection Report",
+  "short_name": "Hinton Water",
+  "description": "Disinfect and sample new PWD water mains so they pass the first time.",
+  "id": "./",
+  "start_url": "./#/",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#062744",
+  "theme_color": "#0a3a63",
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
