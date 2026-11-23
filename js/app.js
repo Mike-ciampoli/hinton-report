@@ -1,874 +1,444 @@
 /* Hinton Water Disinfection Report: the app.
-   PWD rules are in rules.js, the printable PWD forms are in forms.js,
-   saving is in store.js. */
+   Built from the original prototype. Saving on the device is in store.js. */
 'use strict';
 (async () => {
 
-/* ---------- small helpers ---------- */
+/* ---------- helpers ---------- */
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const num = v => (v === '' || v == null || isNaN(+v) ? null : +v);
 const p2 = n => String(n).padStart(2, '0');
-const isoLocal = d => d.getFullYear() + '-' + p2(d.getMonth() + 1) + '-' + p2(d.getDate()) + 'T' + p2(d.getHours()) + ':' + p2(d.getMinutes());
-const today = () => isoLocal(new Date()).slice(0, 10);
-const parseLocal = s => { if (!s) return null; const d = new Date(s.length === 10 ? s + 'T00:00' : s); return isNaN(d) ? null : d; };
+const iso = d => d.getFullYear() + '-' + p2(d.getMonth() + 1) + '-' + p2(d.getDate()) + 'T' + p2(d.getHours()) + ':' + p2(d.getMinutes());
+const today = () => iso(new Date()).slice(0, 10);
+const parse = s => { if (!s) return null; const d = new Date(s.length === 10 ? s + 'T00:00' : s); return isNaN(d) ? null : d; };
 const fmt = d => d.toLocaleString([], { weekday: 'short', month: 'numeric', day: 'numeric', hour: 'numeric', minute: '2-digit' });
-const fmtDate = d => d.toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' });
-const hm = ms => new Date(ms).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
-const mdy = (s, withTime) => { const d = parseLocal(s); if (!d) return ''; let o = p2(d.getMonth() + 1) + '/' + p2(d.getDate()) + '/' + d.getFullYear(); if (withTime) o += ' ' + d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }); return o; };
-const mdyMs = (ms, withTime) => mdy(isoLocal(new Date(ms)), withTime);
-const getP = (o, k) => k.split('.').reduce((a, b) => (a == null ? a : a[b]), o);
-const setP = (o, k, v) => { const ks = k.split('.'), l = ks.pop(); ks.reduce((a, b) => (a[b] ??= {}), o)[l] = v; };
+const mdy = s => { const d = parse(s); if (!d) return ''; return p2(d.getMonth() + 1) + '/' + p2(d.getDate()) + '/' + d.getFullYear() + (s.length > 10 ? ' ' + p2(d.getHours()) + ':' + p2(d.getMinutes()) : ''); };
+const get = (o, k) => k.split('.').reduce((a, b) => (a == null ? a : a[b]), o);
+const set = (o, k, v) => { const ks = k.split('.'), l = ks.pop(); ks.reduce((a, b) => (a[b] ??= {}), o)[l] = v; };
 const uid = () => Math.random().toString(36).slice(2, 10);
-const last = a => a[a.length - 1];
-const DAY = 864e5;
-const left = ms => { const s = Math.max(0, Math.round(ms / 1000)), h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), x = s % 60; return h ? `${h} h ${p2(m)} m ${p2(x)} s` : `${m} m ${p2(x)} s`; };
-const leftShort = ms => { const m = Math.max(0, Math.ceil(ms / 6e4)); return m >= 60 ? `${Math.floor(m / 60)} h ${m % 60} m` : `${m} min`; };
-const footer = () => `<footer class="foot"><p>${esc(RULES.footer[0])}</p><p>${esc(RULES.footer[1])}</p></footer>`;
+const dur = ms => { if (ms == null || isNaN(ms)) return ''; const m = Math.round(Math.abs(ms) / 6e4), d = Math.floor(m / 1440), h = Math.floor((m % 1440) / 60), mm = m % 60; return (ms < 0 ? '−' : '') + (d ? `${d} d ${h} h` : h ? `${h} h ${mm} m` : `${mm} m`); };
+const FOOT = ['© 2026 Michael E. Ciampoli. All rights reserved. Created with help from Claude by Anthropic.',
+  'Field aid only; not affiliated with the Philadelphia Water Department. BLS lab results are the official record.'];
+const footer = () => `<footer class="foot">${FOOT.map(t => `<p>${esc(t)}</p>`).join('')}</footer>`;
+const BLS_PHONE = '(215) 685-1421';
 
-/* ---------- data ---------- */
-const blankState = () => ({ v: 2, jobs: [], settings: { recipients: RULES.recipients.slice(), tags: [] }, meta: { created: Date.now(), lastBackup: null, snoozed: null, firstData: null, alerted: {}, range: {} } });
-const newCf = () => ({ reason: '', flush: [], ver: [], logs: {}, events: [], phase: '' });
-const newRound = kind => ({ kind, method: null, c: {}, fix: {}, r: {}, t: {}, ferrules: [], res: {}, cf: newCf() });
-const newJob = (street, from, to) => ({ id: uid(), created: Date.now(), street, from, to, f: {}, rounds: [newRound('initial')], labs: [], log: [], mail: { off: [], extra: [] } });
-
-let S = await Store.get('state');
-if (!S || !Array.isArray(S.jobs)) S = blankState();
-fixup(S);
-function fixup(s) {
-  s.settings ??= {}; s.settings.recipients ??= RULES.recipients.slice(); s.settings.tags ??= [];
-  s.meta ??= {}; s.meta.alerted ??= {}; s.meta.range ??= {};
-  for (const j of s.jobs) {
-    j.f ??= {}; j.rounds ??= [newRound('initial')]; j.labs ??= []; j.mail ??= { off: [], extra: [] }; j.mail.off ??= []; j.mail.extra ??= [];
-    j.log ??= [];
-    if (typeof j.notes === 'string') { if (j.notes.trim()) j.log.unshift({ id: uid(), t: j.created || Date.now(), ri: 0, stage: '', tags: [], text: j.notes }); delete j.notes; }
-    j.rounds.forEach((r, i) => {
-      r.c ??= {}; r.fix ??= {}; r.r ??= {}; r.t ??= {}; r.ferrules ??= []; r.res ??= {}; r.cf ??= newCf();
-      const cf = r.cf; cf.flush ??= []; cf.ver ??= []; cf.logs ??= {}; cf.events ??= [];
-      if (r.method === undefined) {   // data from version 1.0
-        if (i === 0) r.method = (r.t.loaded || r.r.tablets || Object.keys(r.c).length) ? 'tablets' : null;
-        else { r.res.fix ??= 'rechlor'; r.method = 'rsform'; }
-      }
-    });
-  }
-  s.v = 2;
+/* ---------- data (saved on this device only) ---------- */
+const KEY = 'state3';
+const blank = () => ({ v: 3, jobs: [], settings: { recipients: [] }, meta: { lastBackup: null } });
+function mk(street, from, to) {
+  return { id: uid(), street, from, to,
+    f: { sampleDate: '', contractor: '', contractorEmail: '', work: '', inspector: '', phone: '', engineer: '', engEmail: '', mfr: '', length: '', dia: '', flushPipe: '', nFlush: '', flushLoc: '', nSamples: '', delivered: '' },
+    c: {}, r: { srcTotal: '', lube: '', tablets: '', granules: '', waterT: '', airT: '', weather: '', dissolve: '', hold: '', afterFlush: '', refill: '' },
+    t: { loaded: '', flushStart: '', shutdown: '' }, labs: [], notes: '', mailReq: '' };
 }
+const LABKEYS = ['free', 'total', 'ph', 'turb', 'odor', 'coli', 'ecoli', 'hpc'];
+const lab = date => Object.assign({ date }, Object.fromEntries(LABKEYS.map(k => [k, ''])));
+
+/* Turn a version 1.x save or backup into this shape. Nothing is thrown away on the device. */
+function fromV1(old) {
+  const s = blank();
+  s.settings.recipients = (old.settings && old.settings.recipients) || [];
+  s.meta.lastBackup = (old.meta && old.meta.lastBackup) || null;
+  for (const o of old.jobs || []) {
+    const j = mk(o.street || '', o.from || '', o.to || ''); j.id = o.id || j.id;
+    Object.assign(j.f, o.f || {});
+    const r0 = (o.rounds && o.rounds[0]) || o;
+    Object.assign(j.c, r0.c || {}); Object.assign(j.r, r0.r || {}); Object.assign(j.t, r0.t || {});
+    j.labs = (o.labs || []).map(l => Object.assign(lab(l.date || ''), Object.fromEntries(LABKEYS.map(k => [k, l[k] ?? '']))));
+    const notes = [];
+    if (typeof o.notes === 'string' && o.notes.trim()) notes.push(o.notes.trim());
+    for (const n of o.log || []) if (n.text) notes.push((n.t ? mdy(iso(new Date(n.t))) + '  ' : '') + n.text);
+    j.notes = notes.join('\n\n');
+    s.jobs.push(j);
+  }
+  return s;
+}
+function fixup(s) {
+  s.settings ??= {}; s.settings.recipients ??= []; s.meta ??= {};
+  for (const j of s.jobs) { const b = mk(); for (const k of ['f', 'c', 'r', 't']) j[k] = Object.assign(b[k], j[k] || {}); j.labs ??= []; j.notes ??= ''; j.mailReq ??= ''; }
+  return s;
+}
+let S = await Store.get(KEY);
+if (!S || !Array.isArray(S.jobs)) {
+  const old = await Store.get('state');
+  S = old && Array.isArray(old.jobs) ? fromV1(old) : blank();
+  await Store.put(KEY, S).catch(() => {});
+}
+fixup(S);
 let saveT = null;
-function save() { clearTimeout(saveT); saveT = setTimeout(flush, 250); }
-function flush() { clearTimeout(saveT); saveT = null; return Store.put('state', S).catch(() => toast('Could not save', 'This device is out of storage space. Make a backup now.', true)); }
+const flush = () => { clearTimeout(saveT); saveT = null; return Store.put(KEY, S).catch(() => toast('Could not save. The device may be out of space. Make a backup now.')); };
+const save = () => { clearTimeout(saveT); saveT = setTimeout(flush, 250); };
 addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden' && saveT) flush(); });
 addEventListener('pagehide', () => { if (saveT) flush(); });
 Store.persist();
 
-/* ---------- rules applied to a job ---------- */
-const cur = j => j.rounds.length - 1;
-const isRs = ri => ri > 0;
-const roundName = ri => (ri ? `Resample ${ri}` : 'Initial');
-const isDis = (j, i) => i === 0 || j.rounds[i].res.fix === 'rechlor';
-const disCount = (j, ri) => j.rounds.slice(0, ri + 1).filter((r, i) => isDis(j, i)).length;
-function methodOf(j, ri) {
-  const rd = j.rounds[ri];
-  if (ri === 0) return rd.method || null;
-  const f = rd.res.fix;
-  if (f === 'rechlor') return rd.method || 'rsform';
-  return f ? 'flush' : null;
-}
-const methodLabel = m => (m === 'flush' ? 'Flush only' : RULES.methods[m] || 'Not picked');
-function prevLoaded(j, ri) { for (let i = ri - 1; i >= 0; i--) { const t = j.rounds[i].t.loaded; if (t) return mdy(t, true); } return ''; }
-const usesCf = (j, ri) => methodOf(j, ri) === 'cf';
+let V = { page: 'home', id: null, sec: 'info' };
+try { Object.assign(V, JSON.parse(sessionStorage.getItem('hwdr-v') || '{}')); } catch (e) {}
+let pick = { an: false, ids: [] };
 
-function cfPoints(rd) {
-  return [{ id: 'inj', kind: 'inj', name: 'Injection point', loc: rd.cf.injLoc || '' },
-    ...rd.cf.flush.map((p, i) => ({ id: p.id, kind: 'flush', name: `Flush point #${i + 1}`, loc: p.loc || '', rate: p.rate, dia: p.dia })),
-    ...rd.cf.ver.map((p, i) => ({ id: p.id, kind: 'ver', name: `Verification point #${i + 1}`, loc: p.loc || '' }))];
+/* ---------- PWD rules ---------- */
+const holdH = j => (num(j.r.waterT) != null && +j.r.waterT < 41 ? 48 : 24);
+function until(from, h, label) {
+  if (!from) return ''; const t = new Date(from).getTime() + h * 3600e3, m = Math.round((t - Date.now()) / 6e4);
+  return m <= 0 ? `<span class="b ok">${label} since ${fmt(new Date(t))}</span>` : `<span class="b warn">${label} ${fmt(new Date(t))} · ${Math.floor(m / 60)} h ${m % 60} m left</span>`;
 }
-function cfStatus(rd) {
-  const cf = rd.cf, lo = num(cf.tmin), hi = num(cf.tmax), pts = cfPoints(rd), chk = pts.filter(p => p.kind !== 'inj');
-  const inR = v => lo !== null && hi !== null && v >= lo && v <= hi;
-  const per = {};
-  for (const p of pts) {
-    const all = (cf.logs[p.id] || []).filter(x => !x.void);
-    const feed = all.filter(x => x.ph === 'feed'), hold = all.filter(x => x.ph === 'hold'), fl = all.filter(x => x.ph === 'flush'), l2 = feed.slice(-RULES.cf.stableReadings);
-    per[p.id] = { all, n: all.length, stable: l2.length === RULES.cf.stableReadings && l2.every(x => inR(x.ppm)), lastFeed: last(feed), lastHold: last(hold), lastFlush: last(fl),
-      inRange: feed.length ? inR(last(feed).ppm) : null,
-      holdOk: hold.length ? last(hold).ppm >= RULES.cf.holdMin : null, flushOk: fl.length ? last(fl).ppm <= RULES.cf.flushMax : null };
-  }
-  const nStable = chk.filter(p => per[p.id].stable).length, flushPts = chk.filter(p => p.kind === 'flush');
-  const nHold = chk.filter(p => per[p.id].holdOk === true).length, nFl = flushPts.filter(p => per[p.id].flushOk === true).length;
-  const allStable = chk.length > 0 && nStable === chk.length, holdOk = chk.length > 0 && nHold === chk.length, flushOk = flushPts.length > 0 && nFl === flushPts.length;
-  const phase = cf.phase || (rd.t.flushStart ? 'flush' : rd.t.holdStart ? 'hold' : 'feed');
-  return { pts, chk, per, lo, hi, inR, phase, nStable, allStable, nHold, holdOk, nFl, flushPts, flushOk,
-    stableText: chk.length ? `From the live log: ${nStable} of ${chk.length} points stable.` : 'Add flush and verification points in setup first.',
-    holdText: chk.length ? `From the live log: ${nHold} of ${chk.length} points at 10 ppm or more after the hold.` : '',
-    flushText: flushPts.length ? `From the live log: ${nFl} of ${flushPts.length} flush points at 0 ppm.` : '' };
+const totalOk = (v, j) => v > 1 && (num(j.r.srcTotal) == null || j.r.srcTotal - v <= 0.5);
+const P = [
+  ['free', 'Free chlorine', 'mg/L', () => '0.10 or less', v => v <= 0.10],
+  ['total', 'Total chlorine', 'mg/L', () => 'Above 1.00 and within 0.50 of the main', totalOk],
+  ['ph', 'pH', '', () => '7.0 to 7.4', v => v >= 7 && v <= 7.4],
+  ['turb', 'Turbidity', 'NTU', () => 'Below 0.400', v => v < 0.4],
+  ['odor', 'Odor', '0 or 1', () => '0, no unusual odor', v => v == 0],
+  ['coli', 'Total coliforms', '0 or 1', () => '0, absent', v => v == 0],
+  ['ecoli', 'E. coli', '0 or 1', () => '0, absent', v => v == 0],
+  ['hpc', 'HPC', 'MPN/mL', i => (i ? '6 or less (resample)' : 'Below 50 (initial)'), (v, j, i) => (i ? v <= 6 : v < 50)]];
+const labName = i => (i ? 'Resample ' + i : 'Initial');
+function labRes(a, j, i) { let fails = [], missing = 0; for (const p of P) { const n = num(a[p[0]]); if (n == null) { missing++; continue; } if (!p[4](n, j, i)) fails.push(p[1]); } return { fails, pass: missing ? (fails.length ? false : null) : !fails.length }; }
+function status(j) {
+  const L = j.labs;
+  if (L.length) { const r = labRes(L[L.length - 1], j, L.length - 1); if (r.pass === true) return ['Passed', 'ok']; if (r.pass === false) return ['Resample needed', 'bad']; return ['Waiting on lab', 'warn']; }
+  if (j.t.shutdown) return ['16-hr hold', 'warn']; if (j.t.flushStart) return ['Flushing', 'warn']; if (j.t.loaded) return ['Disinfecting', 'warn']; return ['Getting ready', ''];
 }
-function ctx(j, ri) {
-  const rd = j.rounds[ri];
-  const baseline = num(rd.r.srcTotal) ?? num(j.rounds[0].r.srcTotal);
-  return { j, ri, rd, baseline, method: methodOf(j, ri), holdH: RULES.holdHours(num(rd.r.waterT), methodOf(j, ri)), prevLoaded: prevLoaded(j, ri), cfs: cfStatus(rd) };
-}
-const val = (c, k) => (k.startsWith('job.') ? getP(c.j, k.slice(4)) : getP(c.rd, k));
-const path = (c, k) => (k.startsWith('job.') ? k.slice(4) : `rounds.${c.ri}.${k}`);
-const fixKey = k => k.replace(/\./g, '_');
-const txt = (x, c) => (typeof x === 'function' ? x(c) : x);
-const vis = (c, it) => !it.show || it.show(c);
-function itemState(c, it) {
-  const v = val(c, it.k);
-  if (it.t === 'yn') { if (!v) return ''; if (it.warnOn && v === it.warnOn) return 'warn'; if (it.good === null) return ''; return v === (it.good || 'Y') ? 'ok' : 'bad'; }
-  if (it.t === 'num' && it.ok) { const n = num(v); return n === null ? '' : it.ok(n, c) ? 'ok' : 'bad'; }
+const released = j => { const i = j.labs.findIndex((a, k) => labRes(a, j, k).pass === true); return i < 0 ? null : { i, date: j.labs[i].date }; };
+
+const G = [
+  { g: 'Preventive measures', items: [
+    { k: 'c.p1', t: 'yn', q: 'Pipe strung out on cribs at least 6 in above ground' },
+    { k: 'c.p2', t: 'yn', q: 'Pipe capped, wrapped or sealed at all times before install' },
+    { k: 'c.p3', t: 'yn', q: 'Seals stayed in place until the trench was dry' },
+    { k: 'c.p4', t: 'yn', q: 'Joints, pipe interior and fittings inspected; any dirt swabbed or sprayed with disinfecting solution' },
+    { k: 'c.p5', t: 'yn', q: 'Interior coatings found tacky before install', good: 'N' },
+    { k: 'r.lube', t: 'text', q: 'Pipe joint lubricant (brand)' },
+    { k: 'c.p6', t: 'yn', q: 'Lubricant in closed containers, kept clean, dedicated disposable brushes' },
+    { k: 'c.p7', t: 'yn', q: 'Supply main flushed at least 15 minutes before filling' },
+    { k: 'r.srcTotal', t: 'num', u: 'ppm', q: 'Source water TOTAL chlorine (baseline)', hint: 'City water averaged about 1.5 to 2.5 ppm in 2025. Saved for the refill and lab checks.', ok: v => v >= 1 }] },
+  { g: 'Disinfection', items: [
+    { k: 't.loaded', t: 'time', q: 'Main loaded (tablets in, fill started)' },
+    { k: 'r.tablets', t: 'num', u: 'per pipe', q: 'Calcium hypochlorite tablets' },
+    { k: 'r.granules', t: 'yn', q: 'Chlorine granules added too', good: null },
+    { k: 'c.d1', t: 'yn', q: 'Valves set so chlorine cannot reach active mains' },
+    { k: 'c.d2', t: 'yn', q: 'Fill velocity no more than 1 ft/s' },
+    { k: 'r.waterT', t: 'num', u: '°F', q: 'Water temperature', hint: 'Below 41°F the hold becomes 48 hours.' },
+    { k: 'r.airT', t: 'num', u: '°F', q: 'Outside air temperature' },
+    { k: 'r.weather', t: 'text', q: 'Weather' },
+    { k: 'r.dissolve', t: 'num', u: 'ppm', q: 'FREE chlorine after tablets dissolve', hint: 'At least 25 ppm. About 7 hrs in normal temps, longer when cold. Bleed off some water to spread it.', ok: v => v >= 25, at: j => until(j.t.loaded, 7, 'Test') },
+    { k: 'r.hold', t: 'num', u: 'ppm', q: j => `FREE chlorine after ${holdH(j)}-hour hold`, hint: 'At least 10 ppm.', ok: v => v >= 10, at: j => until(j.t.loaded, holdH(j), 'Hold done') }] },
+  { g: 'Flushing and release', items: [
+    { k: 't.flushStart', t: 'time', q: 'Flushing started' },
+    { t: 'calc' },
+    { k: 'c.f1', t: 'yn', q: 'Flush velocity at least 3 ft/s' },
+    { k: 'c.f2', t: 'yn', q: 'At least 3 pipe volumes flushed at the end of the main' },
+    { k: 'c.f3', t: 'yn', q: 'Approved backflow preventer on hydrant connections' },
+    { k: 'c.f4', t: 'yn', q: 'Chlorinated water to sanitary sewer through an air gap, or dechlorinated' },
+    { k: 'r.afterFlush', t: 'num', u: 'ppm', q: 'FREE chlorine after flushing', hint: 'Should be none left.', ok: v => v <= 0.1 },
+    { k: 'r.refill', t: 'num', u: 'ppm', q: 'TOTAL chlorine after refill', hint: 'Above 1.0 and no more than 0.5 below your baseline.', ok: totalOk },
+    { k: 't.shutdown', t: 'time', q: 'Shut down for the 16-hour hold', at: j => until(j.t.shutdown, 16, 'Ready to sample') },
+    { k: 'c.f5', t: 'yn', q: `Called BLS before the 16-hour hold: ${BLS_PHONE}` },
+    { k: 'c.f6', t: 'yn', q: 'Signed form and sketch sent as PDF (reply all to BLS)' },
+    { k: 'c.f7', t: 'yn', q: 'Copper tubing on sample points before BLS arrives' }] }];
+const ITEMS = G.flatMap(g => g.items).filter(i => i.k);
+const qText = (it, j) => (typeof it.q === 'function' ? it.q(j) : it.q);
+function state(j, it) {
+  const v = get(j, it.k);
+  if (it.t === 'yn') { if (!v || it.good === null) return ''; return v === (it.good || 'Y') ? 'ok' : 'bad'; }
+  if (it.t === 'num' && it.ok) { const n = num(v); return n == null ? '' : it.ok(n, j) ? 'ok' : 'bad'; }
   return '';
 }
-function groups(j, ri) {
-  const rd = j.rounds[ri];
-  if (ri === 0) return rd.method === 'cf' ? RULES.cfGroups : rd.method === 'tablets' ? RULES.tablets : [];
-  const f = rd.res.fix, rest = f === 'reflush' || f === 'scour' ? RULES.reflush : f === 'rechlor' ? (rd.method === 'cf' ? RULES.cfGroups : rd.method === 'rsform' ? RULES.rechlor : []) : f === 'other' ? RULES.otherFix : [];
-  return [RULES.resolution, ...rest];
-}
-const items = c => groups(c.j, c.ri).flatMap(g => g.items).filter(i => i.k && vis(c, i));
-const timerIds = (j, ri) => groups(j, ri).flatMap(g => g.items).filter(i => i.t === 'timer').map(i => i.id);
-function ferrState(f) { const n = num(f.ppm); return n === null ? '' : n >= RULES.ferruleMin ? 'ok' : 'bad'; }
-function flags(j, ri) {
-  const c = ctx(j, ri); let filled = 0, red = 0, needFix = 0; const all = items(c).filter(i => i.t !== 'sel' && i.t !== 'auto');
-  for (const it of all) {
-    if (val(c, it.k)) filled++;
-    if (itemState(c, it) === 'bad') { red++; if (!(c.rd.fix[fixKey(it.k)] || '').trim()) needFix++; }
-  }
-  if (groups(j, ri).some(g => g.items.some(i => i.t === 'ferrules'))) for (const f of c.rd.ferrules) if (ferrState(f) === 'bad') red++;
-  return { filled, total: all.length, red, needFix };
-}
-function timer(j, ri, id) {
-  const c = ctx(j, ri), d = RULES.timers[id];
-  const hours = typeof d.hours === 'function' ? d.hours(c) : d.hours;
-  const name = typeof d.name === 'function' ? d.name(c) : d.name;
-  const st = parseLocal(getP(c.rd, d.from));
-  if (!st || !hours) return { id, name, hours, d, start: null };
-  const end = new Date(st.getTime() + hours * 36e5);
-  return { id, name, hours, d, start: st, end, left: end - Date.now(), key: `${j.id}|${ri}|${id}|${end.getTime()}` };
-}
-function labEval(j, row) {
-  const b = ctx(j, row.ri).baseline, multi = disCount(j, row.ri) > 1; let fails = [], missing = 0;
-  for (const p of RULES.lab) { const n = num(row[p.k]); if (n === null) { missing++; continue; } if (!p.ok(n, b, multi)) fails.push(p.name); }
-  return { fails, missing, pass: fails.length ? false : missing ? null : true };
-}
-function roundResult(j, ri) {
-  const rows = j.labs.filter(l => l.ri === ri); if (!rows.length) return undefined;
-  const ev = rows.map(r => labEval(j, r));
-  if (ev.some(e => e.pass === false)) return false;
-  if (ev.every(e => e.pass === true)) return true;
-  return null;
-}
-function status(j) {
-  const ri = cur(j), rr = roundResult(j, ri), t = j.rounds[ri].t;
-  if (rr === true) return ['Passed', 'ok'];
-  if (rr === false) return ['Failed: fix needed', 'bad'];
-  if (rr === null) return ['Waiting on lab', 'warn'];
-  const sd = parseLocal(t.shutdown);
-  if (sd) return Date.now() >= sd.getTime() + 16 * 36e5 ? ['Waiting on lab', 'warn'] : ['16-hr hold', 'prog'];
-  if (t.flushStart) return ['Flushing', 'prog'];
-  if (t.holdStart) return ['24-hr hold', 'prog'];
-  if (t.loaded) return ['Disinfecting', 'prog'];
-  return [ri ? 'Resolution' : 'Getting ready', ''];
-}
-function nextTimer(j) {
-  const ri = cur(j); let best = null;
-  for (const id of timerIds(j, ri)) { const t = timer(j, ri, id); if (t.start && t.left > 0 && (!best || t.left < best.left)) best = t; }
-  return best;
-}
+function progress(j) { let d = 0, b = 0; for (const it of ITEMS) { if (get(j, it.k)) d++; if (state(j, it) === 'bad') b++; } return { d, b, n: ITEMS.length }; }
 
-/* ---------- routing (#/..., so the phone's back button works) ---------- */
-let V = {};
-function route() {
-  const p = location.hash.replace(/^#\/?/, '').split('/').map(decodeURIComponent);
-  V = { page: p[0] || 'home', id: p[1], sec: p[2] || 'steps', ri: p[3] != null && p[3] !== '' ? +p[3] : null };
-  if (V.page === 'print') { V.kind = p[2]; }
-  if ((V.page === 'job' || (V.page === 'print' && V.id !== 'range')) && !S.jobs.find(j => j.id === V.id)) V.page = 'home';
-}
-const go = h => { if (location.hash === h) render(); else location.hash = h; };
-addEventListener('hashchange', () => { route(); scrollTo(0, 0); render(); });
+/* ---------- street screens ---------- */
+const FIELDS = [['street', 'Street name'], ['from', 'From'], ['to', 'To'], ['f.work', 'Work #'], ['f.sampleDate', 'Sample date requested', 'date'], ['f.contractor', 'Contractor'], ['f.contractorEmail', 'Contractor email', 'email'], ['f.inspector', 'Inspector'], ['f.phone', 'Inspector phone', 'tel'], ['f.engineer', 'Division engineer'], ['f.engEmail', 'Division engineer email', 'email'], ['f.mfr', 'Pipe manufacturer'], ['f.delivered', 'Pipe delivered to site', 'date'], ['f.length', 'Pipe length (ft)', 'number'], ['f.dia', 'Pipe diameter (in)', 'number'], ['f.flushPipe', 'Flushing pipe size (in)', 'number'], ['f.nFlush', 'Number of flushing locations', 'number'], ['f.flushLoc', 'Flushing location(s)'], ['f.nSamples', 'Number of samples requested', 'number']];
+const fid = k => 'in-' + k.replace(/\./g, '-');
 
-/* ---------- pages ---------- */
-const app = $('#app');
-const job = () => S.jobs.find(j => j.id === V.id);
-
-function backupBanner() {
-  if (!S.jobs.length) return '';
-  const base = Math.max(S.meta.lastBackup || 0, S.meta.snoozed || 0, S.meta.firstData || 0);
-  if (Date.now() - base < 7 * DAY) return '';
-  const msg = S.meta.lastBackup ? `Your last backup was ${Math.floor((Date.now() - S.meta.lastBackup) / DAY)} days ago.` : 'You haven’t made a backup yet.';
-  return `<div class="banner warn"><p><b>Time to back up.</b> ${msg} Your data lives only on this device, so a backup file keeps it safe if the phone is lost or reset.</p><div class="acts"><button class="btn" data-act="backup">Back up now</button><button class="btn ghost" data-act="snooze">Remind me next week</button></div></div>`;
+function item(j, it) {
+  if (it.t === 'calc') return calc(j);
+  const v = get(j, it.k), q = qText(it, j), st = state(j, it), id = fid(it.k); let ctl = '';
+  if (it.t === 'yn') ctl = `<div class="yn">${['Y', 'N'].map(x => `<button data-yn="${it.k}" data-v="${x}" class="${v === x ? 'on' : ''}" aria-pressed="${v === x}">${x === 'Y' ? 'Yes' : 'No'}</button>`).join('')}</div>`;
+  else if (it.t === 'num') ctl = `<div class="nw"><input id="${id}" data-k="${it.k}" type="number" step="any" inputmode="decimal" value="${esc(v)}" aria-label="${esc(q)}"><span>${it.u}</span></div>`;
+  else if (it.t === 'time') ctl = `<input id="${id}" data-k="${it.k}" type="datetime-local" value="${esc(v)}" aria-label="${esc(q)}">`;
+  else ctl = `<input id="${id}" data-k="${it.k}" value="${esc(v)}" aria-label="${esc(q)}">`;
+  return `<div class="it ${st}"><div class="q"><span class="dot"></span><div><b>${esc(q)}</b>${it.hint ? `<small>${it.hint}</small>` : ''}${it.at ? it.at(j) : ''}${st === 'bad' ? `<small class="fix">${it.t === 'yn' ? 'Write the corrective action in Notes before asking for a sample.' : 'Out of range. Fix before calling BLS.'}</small>` : ''}</div></div>${ctl}</div>`;
 }
-function runningBanner() {
-  const rows = [];
-  for (const j of S.jobs) { const ri = cur(j); for (const id of timerIds(j, ri)) { const t = timer(j, ri, id); if (t.start && t.left > 0) rows.push([t, j]); } }
-  if (!rows.length) return '';
-  rows.sort((a, b) => a[0].left - b[0].left);
-  return `<div class="banner"><p><b>Timers running</b><br>${rows.map(([t, j]) => `<a href="#/job/${j.id}/steps">${esc(j.street)}</a>: ${esc(t.name)}, <span data-end="${t.end.getTime()}" data-short="1">${leftShort(t.left)}</span> left`).join('<br>')}</p></div>`;
+function calc(j) {
+  const L = num(j.f.length), D = num(j.f.dia);
+  if (!L || !D) return `<div class="calc"><div>Enter pipe length and diameter under Job info to see the flush target.</div></div>`;
+  const gal = 0.0408 * D * D * L, gpm = 7.34 * D * D;
+  return `<div class="calc"><div>One pipe volume<strong>${Math.round(gal).toLocaleString()} gal</strong></div><div>Flush 3 volumes<strong>${Math.round(gal * 3).toLocaleString()} gal</strong></div><div>Flow for 3 ft/s in ${D}" main<strong>${Math.round(gpm).toLocaleString()} gpm</strong></div><div>Rule of thumb, 2 min per 100 ft<strong>${Math.max(1, Math.round(L / 50))} min</strong></div></div>`;
 }
-function howto(full) {
-  return `<section class="card howto"><h3>How to use this app</h3>
-<ol>
-<li><b>Add a street</b> for each new main, then fill in its <b>Job info</b>.</li>
-<li>In <b>Steps</b>, pick the method: <b>Tablets</b> or <b>Continuous feed</b>. Work down the checklist. A wrong answer turns <b style="color:var(--bad)">red</b> and asks what was done to fix it.</li>
-<li>Continuous feed has a <b>live log</b>: tap to add a chlorine reading at each point and the time is stamped for you.</li>
-<li>Start the <b>timers</b> and tap <b>Add to calendar</b>, so your phone reminds you even with the app closed.</li>
-<li>Use <b>Email</b> to request the sample, and <b>Print</b> for the PWD forms and logs.</li>
-<li>Enter BLS results under <b>Lab results</b>. If a sample fails, start a <b>resolution round</b> and record the lab’s fix.</li>
-<li>Everything saves on this device and works with no signal. <b>Back up</b> once a week.</li>
-</ol>
-${full ? `<h3 style="margin-top:14px">Put it on your home screen</h3><div class="inst">
-<div><b>iPhone:</b> open the app’s link in Safari, tap the Share button, then <b>Add to Home Screen</b>.</div>
-<div><b>Android:</b> open the link in Chrome, tap the ⋮ menu, then <b>Install app</b> (or Add to Home screen).</div>
-<div><b>Windows:</b> open the link in Edge or Chrome and click the install icon at the right end of the address bar.</div></div>` : `<p class="small mut"><a href="#/help">Installing on your home screen and more help</a></p>`}
-</section>`;
-}
-function home() {
-  const js = S.jobs;
-  const add = `<form class="add" id="addf"><h3>${js.length ? 'Add a street' : 'Add your first street'}</h3><input id="a-st" placeholder="Street name" aria-label="Street name" required autocomplete="off"><input id="a-from" placeholder="From (cross street)" aria-label="From" autocomplete="off"><input id="a-to" placeholder="To (cross street)" aria-label="To" autocomplete="off"><button class="btn">Add street</button></form>`;
-  if (!js.length) return `<div class="top"><h2>Streets</h2></div>${howto(false)}${add}`;
-  return `${backupBanner()}${runningBanner()}<div class="top"><h2>Streets <span class="mut" style="font-size:18px">${js.length}</span></h2><span class="mut">Tap a tab to open its folder</span></div>
-<div id="idx">${js.map((j, i) => {
-    const L = 22 + (i % 8) * 5.5, dark = L < 46, [s, c] = status(j), nt = nextTimer(j);
-    return `<a class="tab" href="#/job/${j.id}/steps" style="background:hsl(${206 - (i % 8) * 2} 78% ${L}%);color:${dark ? '#fff' : '#06203a'}"><span><span class="nm">${esc(j.street)}</span><small>${esc([j.from, j.to].filter(Boolean).join(' to '))}${cur(j) ? ` · ${roundName(cur(j))}` : ''}</small>${nt ? `<small class="tm">${esc(nt.name)}: <span data-end="${nt.end.getTime()}" data-short="1">${leftShort(nt.left)}</span> left</small>` : ''}</span><span class="chip"><i class="${c}"></i>${s}</span></a>`;
-  }).join('')}</div><div class="drawer"></div>${add}`;
-}
-
-/* --- steps --- */
-function itemHtml(c, it) {
-  if (!vis(c, it)) return '';
-  if (it.t === 'note') return `<div class="note ${it.tone || ''}">${it.html}${it.fill ? fillRate(c.j) : ''}</div>`;
-  if (it.t === 'calc') return calcHtml(c.j);
-  if (it.t === 'timer') return timerHtml(c.j, c.ri, it.id);
-  if (it.t === 'ferrules') return ferrHtml(c);
-  if (it.t === 'cfpoints') return cfPointsHtml(c);
-  if (it.t === 'cflive') return cfLiveHtml(c);
-  const q = txt(it.q, c);
-  if (it.t === 'auto') { const v = txt(it.v, c); return `<div class="it"><div class="q"><span class="dot"></span><div><b>${esc(q)}</b><small>Filled in automatically.</small></div></div><div class="auto">${esc(v || '—')}</div></div>`; }
-  const v = val(c, it.k) ?? '', st = itemState(c, it), p = path(c, it.k), id = 'f-' + p.replace(/\./g, '-');
-  let ctl;
-  if (it.t === 'yn') ctl = `<div class="yn" role="group" aria-label="${esc(q)}">${['Y', 'N'].map(x => `<button data-yn="${p}" data-v="${x}" class="${v === x ? 'on' : ''} ${v === x && st === 'bad' ? 'no' : ''} ${v === x && st === 'warn' ? 'wn' : ''}" aria-pressed="${v === x}">${x === 'Y' ? 'Yes' : 'No'}</button>`).join('')}</div>`;
-  else if (it.t === 'sel') ctl = `<div class="yn sel" role="group" aria-label="${esc(q)}">${it.opts.map(([x, l]) => `<button data-sel="${p}" data-v="${x}" class="${v === x ? 'on' : ''}" aria-pressed="${v === x}">${esc(l)}</button>`).join('')}</div>`;
-  else if (it.t === 'num') ctl = `<div class="nw"><input id="${id}" data-k="${p}" type="number" step="any" inputmode="decimal" value="${esc(v)}" aria-label="${esc(q)}"><span>${it.u || ''}</span></div>`;
-  else if (it.t === 'time') ctl = `<div class="tw"><input id="${id}" data-k="${p}" type="datetime-local" value="${esc(v)}" aria-label="${esc(q)}"><button class="btn ghost sm" data-now="${p}">Now</button></div>`;
-  else if (it.t === 'date') ctl = `<input class="tx" id="${id}" data-k="${p}" type="date" value="${esc(v)}" aria-label="${esc(q)}">`;
-  else ctl = `<input class="tx" id="${id}" data-k="${p}" ${it.t === 'tel' ? 'type="tel"' : ''} value="${esc(v)}" placeholder="${esc(it.ph || '')}" aria-label="${esc(q)}">`;
-  let fix = '';
-  if (st === 'bad') {
-    const fk = `rounds.${c.ri}.fix.${fixKey(it.k)}`, fv = c.rd.fix[fixKey(it.k)] || '';
-    fix = `<div class="fixbox ${fv.trim() ? 'done' : ''}"><label for="${'f-' + fk.replace(/\./g, '-')}">${fv.trim() ? 'Corrective action' : 'Corrective action needed: what was done to fix it?'}</label><textarea id="${'f-' + fk.replace(/\./g, '-')}" data-k="${fk}" placeholder="Required before asking for a sample">${esc(fv)}</textarea></div>`;
-  }
-  const hint = txt(it.hint, c);
-  return `<div class="it ${st} ${it.t === 'sel' ? 'wide' : ''}"><div class="q"><span class="dot"></span><div><b>${esc(q)}</b>${it.flag ? '<span class="b flag">Flag item</span>' : ''}${hint ? `<small>${esc(hint)}</small>` : ''}${it.fp ? '<small class="fp">Field practice, not on the PWD form</small>' : ''}${st === 'bad' && it.t === 'num' ? `<small class="fix">Out of range: needs ${esc(it.okText || 'a passing value')}.</small>` : ''}</div></div>${ctl}${fix}</div>`;
-}
-function fillRate(j) { const D = num(j.f.dia); return D ? ` Max fill rate for a ${D}" main: <b>${Math.round(RULES.flush.gpmAt(D, 1)).toLocaleString()} gpm</b>.` : ''; }
-function calcHtml(j) {
-  const L = num(j.f.length), D = num(j.f.dia), F = RULES.flush;
-  let out = '<div class="out"><div>Enter the length and diameter to see flush targets.</div></div>';
-  if (L && D) {
-    const gal = F.gallonsPerFt(D) * L, gpm = F.gpmAt(D, 3), mins = 3 * gal / gpm;
-    out = `<div class="out"><div>1 pipe volume<strong>${Math.round(gal).toLocaleString()} gal</strong></div><div>3 pipe volumes<strong>${Math.round(gal * 3).toLocaleString()} gal</strong></div><div>Flow needed for 3 ft/s<strong>${Math.round(gpm).toLocaleString()} gpm</strong></div><div>3 volumes at 3 ft/s takes<strong>${mins < 10 ? mins.toFixed(1) : Math.round(mins)} min</strong></div><div>“2 min per 100 ft” rule<strong>${+(L / 100 * F.minutesPer100ft).toFixed(1)} min</strong></div></div>
-<p class="sample">Gallons = 0.0408 × ${D}² × ${L.toLocaleString()} ft. Flow for 3 ft/s = 7.34 × ${D}².</p>`;
-  }
-  return `<div class="calc"><h4 style="margin:0 0 8px;font:700 19px 'Barlow Semi Condensed',sans-serif">Flush calculator</h4><div class="in"><label>Length (ft)<input data-k="f.length" id="c-len" type="number" inputmode="decimal" step="any" value="${esc(j.f.length ?? '')}"></label><label>Diameter (in)<input data-k="f.dia" id="c-dia" type="number" inputmode="decimal" step="any" value="${esc(j.f.dia ?? '')}"></label></div>${out}</div>`;
-}
-const FROM_LABEL = { 't.loaded': 'Main loaded', 't.shutdown': 'Shut down', 't.holdStart': 'Start of 24-hour hold' };
-function timerHtml(j, ri, id) {
-  const t = timer(j, ri, id), live = ri === cur(j);
-  let cls = '', body, acts = '';
-  if (!t.start) {
-    if (id === 'interval') { if (!t.hours) return ''; body = '<div class="small mut">Starts when you add a reading in the live log.</div>'; }
-    else body = `<div class="small mut">${t.d.start ? 'Tap Start when the pre-flush begins.' : `Starts from “${FROM_LABEL[t.d.from] || 'the time above'}”. Fill that in to start the countdown.`}</div>`;
-    if (t.d.start && live) acts = `<button class="btn" data-tstart="${id}">Start ${t.hours < 1 ? Math.round(t.hours * 60) + ' min' : t.hours + ' hr'}</button>`;
-  } else if (t.left > 0) {
-    cls = 'run';
-    body = `<div class="cd" data-end="${t.end.getTime()}">${left(t.left)}</div><div class="small mut">Done ${esc(fmt(t.end))}</div>`;
-  } else {
-    cls = 'done';
-    body = `<div class="cd">Done ${esc(fmt(t.end))}</div><div class="small mut">${esc(t.d.doneMsg)}</div>`;
-  }
-  if (t.start && live) {
-    if (t.left > 0 && id !== 'interval') acts += `<button class="btn" data-ics="${id}">Add to calendar</button>`;
-    if (t.d.start) acts += `<button class="btn ghost sm" data-tclear="${id}">${t.left > 0 ? 'Cancel' : 'Clear'}</button>`;
-  }
-  const gc = t.start && live && t.left > 0 && id !== 'interval' ? `<a class="gc" href="${esc(gcalUrl(j, t))}" target="_blank" rel="noopener">Use Google Calendar instead</a>` : '';
-  return `<div class="timer ${cls}"><div><h4>⏱ ${esc(t.name)}</h4>${body}</div><div><div class="acts">${acts}</div>${gc}</div></div>`;
-}
-function ferrHtml(c) {
-  const fs = c.rd.ferrules, low = fs.map(f => num(f.ppm)).filter(n => n !== null);
-  const min = low.length ? Math.min(...low) : null;
-  return `<div class="it ${min === null ? '' : min >= RULES.ferruleMin ? 'ok' : 'bad'}" style="grid-template-columns:1fr"><div class="q"><span class="dot"></span><div><b>FREE chlorine measured at regular intervals at the ferrules</b><small>No location in the main under ${RULES.ferruleMin} ppm.</small>${min !== null ? `<span class="b ${min >= RULES.ferruleMin ? 'ok' : 'bad'}">Lowest reading: ${min} ppm${min >= RULES.ferruleMin ? '' : '. Keep feeding before the hold.'}</span>` : ''}</div></div>
-<div>${fs.map((f, i) => `<div class="ferr"><input data-k="rounds.${c.ri}.ferrules.${i}.loc" id="fr-${c.ri}-${i}-l" value="${esc(f.loc)}" placeholder="Ferrule location" aria-label="Ferrule ${i + 1} location"><div class="nw" style="width:auto"><input data-k="rounds.${c.ri}.ferrules.${i}.ppm" id="fr-${c.ri}-${i}-p" type="number" step="any" inputmode="decimal" value="${esc(f.ppm)}" aria-label="Ferrule ${i + 1} ppm"><span>ppm</span></div>${ferrState(f) ? `<span class="b ${ferrState(f)}">${ferrState(f) === 'ok' ? 'OK' : 'Under 25'}</span>` : '<span></span>'}<button class="btn ghost sm" data-ferdel="${i}" aria-label="Remove ferrule ${i + 1}">✕</button></div>`).join('')}
-<button class="btn ghost" data-feradd="1">+ Add ferrule reading</button></div></div>`;
-}
-
-/* --- continuous feed --- */
-function cfPointsHtml(c) {
-  const cf = c.rd.cf, base = `rounds.${c.ri}.cf`;
-  const used = id => (cf.logs[id] || []).length > 0;
-  const fl = cf.flush.map((p, i) => `<div class="ptrow"><b>Flush #${i + 1}</b><input data-k="${base}.flush.${i}.loc" id="pf-${i}-l" value="${esc(p.loc)}" placeholder="Location" aria-label="Flush point ${i + 1} location"><div class="nw"><input data-k="${base}.flush.${i}.dia" id="pf-${i}-d" type="number" step="any" inputmode="decimal" value="${esc(p.dia)}" aria-label="Flush point ${i + 1} diameter"><span>in</span></div><div class="nw"><input data-k="${base}.flush.${i}.rate" id="pf-${i}-r" type="number" step="any" inputmode="decimal" value="${esc(p.rate)}" aria-label="Flush point ${i + 1} total flush rate"><span>gpm</span></div>${used(p.id) ? '<span class="small mut">Has readings</span>' : `<button class="btn ghost sm" data-ptdel="flush|${i}" aria-label="Remove flush point ${i + 1}">✕</button>`}</div>`).join('');
-  const vr = cf.ver.map((p, i) => `<div class="ptrow v"><b>Verif. #${i + 1}</b><input data-k="${base}.ver.${i}.loc" id="pv-${i}-l" value="${esc(p.loc)}" placeholder="Location / description" aria-label="Verification point ${i + 1} location">${used(p.id) ? '<span class="small mut">Has readings</span>' : `<button class="btn ghost sm" data-ptdel="ver|${i}" aria-label="Remove verification point ${i + 1}">✕</button>`}</div>`).join('');
-  return `<div class="it" style="grid-template-columns:1fr"><div class="q"><span class="dot"></span><div><b>Flush points (up to ${RULES.cf.maxFlush}) and additional verification points (up to ${RULES.cf.maxVerify})</b><small>Each one gets its own live log and Chlorine Verification Log.</small></div></div>
-<div>${fl}${cf.flush.length < RULES.cf.maxFlush ? '<button class="btn ghost sm" data-ptadd="flush">+ Flush point</button>' : ''}</div>
-<div>${vr}${cf.ver.length < RULES.cf.maxVerify ? '<button class="btn ghost sm" data-ptadd="ver">+ Verification point</button>' : ''}</div></div>`;
-}
-const PH = { feed: 'Feeding', hold: 'After hold', flush: 'Final flush' };
-const EV = { start: 'Start', change: 'Rate change', stop: 'Stop' };
-function evWhat(rd, w) { if (w === 'inj') return 'Injection'; const i = rd.cf.flush.findIndex(p => p.id === w); return i < 0 ? 'Flush point' : `Flush #${i + 1}`; }
-function cfLiveHtml(c) {
-  const rd = c.rd, cf = rd.cf, s = c.cfs, live = c.ri === cur(c.j);
-  let h = '';
-  if (!s.chk.length) h += '<div class="note warn">Add the flush and verification points in setup above, so each gets a log.</div>';
-  if (s.lo === null || s.hi === null) h += '<div class="note warn">Enter the target minimum and maximum above. Readings are judged against that range.</div>';
-  else h += `<div class="note">Target range: <b>${s.lo} to ${s.hi} ppm</b>. A point turns green after ${RULES.cf.stableReadings} readings in a row inside it.</div>`;
-  h += `<div class="phase" role="group" aria-label="Which stage new readings belong to"><span class="small mut">New readings are for:</span>${Object.entries(PH).map(([k, l]) => `<button class="${s.phase === k ? 'on' : ''}" data-phase="${k}" aria-pressed="${s.phase === k}">${l}</button>`).join('')}</div>`;
-  if (s.phase === 'feed') h += s.allStable ? '<div class="banner ok"><p><b>OK to shut off injection.</b> Every flush and verification point had 2 readings in a row in range.</p></div>' : `<div class="banner"><p><b>Keep feeding.</b> ${s.nStable} of ${s.chk.length} points stable so far.</p></div>`;
-  if (s.phase === 'hold') h += s.holdOk ? '<div class="banner ok"><p><b>Hold passed.</b> Every point read 10 ppm or more after the hold.</p></div>' : `<div class="banner"><p><b>After the hold every point needs 10 ppm or more.</b> ${s.nHold} of ${s.chk.length} so far.</p></div>`;
-  if (s.phase === 'flush') h += s.flushOk ? '<div class="banner ok"><p><b>Flushing done.</b> Every flush point reads 0 ppm.</p></div>' : `<div class="banner"><p><b>Flush until every flush point reads 0 ppm.</b> ${s.nFl} of ${s.flushPts.length} so far.</p></div>`;
-  const opts = [['inj', 'Injection'], ...cf.flush.map((p, i) => [p.id, `Flush #${i + 1}${p.loc ? ` (${p.loc})` : ''}`])];
-  h += `<div class="evbox"><h4>Injection and flush: start, change, stop</h4>${live ? `<div class="evrow"><select id="ev-what" aria-label="Which">${opts.map(([v, l]) => `<option value="${v}">${esc(l)}</option>`).join('')}</select><div class="nw"><input id="ev-rate" type="number" step="any" inputmode="decimal" placeholder="Rate" aria-label="Rate in gpm"><span>gpm</span></div></div>
-<div class="btns">${Object.entries(EV).map(([k, l]) => `<button class="btn ${k === 'stop' ? 'red' : k === 'change' ? 'ghost' : ''}" data-ev="${k}">${l}</button>`).join('')}</div>` : ''}
-${cf.events.length ? `<ul class="evlist">${cf.events.slice().reverse().map(e => `<li><b>${esc(hm(e.t))}</b> ${esc(evWhat(rd, e.what))}: ${EV[e.act]}${e.rate ? `, ${esc(e.rate)} gpm` : ''} <span class="mut small">${esc(mdyMs(e.t))}</span></li>`).join('')}</ul>` : '<p class="small mut">Nothing logged yet. The time is stamped when you tap.</p>'}</div>`;
-  h += `<div class="pts">${s.pts.map(p => {
-    const st = s.per[p.id], cls = p.kind === 'inj' ? '' : s.phase === 'feed' ? (st.stable ? 'ok' : st.inRange === false ? 'bad' : '') : s.phase === 'hold' ? (st.holdOk === true ? 'ok' : st.holdOk === false ? 'bad' : '') : p.kind === 'flush' ? (st.flushOk === true ? 'ok' : st.flushOk === false ? 'bad' : '') : '';
-    const badge = p.kind === 'inj' ? '' : s.phase === 'feed' ? (st.stable ? '<span class="b ok">Stable</span>' : st.inRange === false ? '<span class="b bad">Out of range</span>' : st.inRange ? '<span class="b prog">1 in range</span>' : '') : s.phase === 'hold' ? (st.holdOk === true ? '<span class="b ok">10+ ppm</span>' : st.holdOk === false ? '<span class="b bad">Under 10</span>' : '') : p.kind === 'flush' ? (st.flushOk === true ? '<span class="b ok">0 ppm</span>' : st.flushOk === false ? '<span class="b bad">Not 0 yet</span>' : '') : '';
-    const rows = (cf.logs[p.id] || []).map((x, i) => [x, i]).reverse();
-    return `<div class="pt ${cls}"><div class="pth"><div><b>${esc(p.name)}</b><small>${esc(p.loc || 'No location yet')}</small></div>${badge}</div>
-${live ? `<form class="rdf" data-pt="${p.id}" data-ri="${c.ri}"><div class="nw"><input id="rd-${p.id}" type="number" step="any" inputmode="decimal" placeholder="Free Cl₂" aria-label="${esc(p.name)} free chlorine reading"><span>ppm</span></div><input id="rn-${p.id}" placeholder="Comment (optional)" aria-label="${esc(p.name)} comment"><button class="btn">Add reading</button></form>` : ''}
-${rows.length ? `<table class="rdl"><tbody>${rows.map(([x, i]) => `<tr class="${x.void ? 'void' : ''}"><td>${esc(hm(x.t))}</td><td><b>${esc(x.ppm)}</b> ppm${p.kind !== 'inj' && x.ph === 'feed' && !x.void && s.lo !== null && s.hi !== null ? (s.inR(x.ppm) ? ' <span class="b ok">in</span>' : ' <span class="b bad">out</span>') : ''}</td><td class="mut small">${PH[x.ph]}${x.note ? ` · ${esc(x.note)}` : ''}${x.void ? ' · marked as a mistake' : ''}</td><td>${live && !x.void ? `<button class="lk" data-void="${c.ri}|${p.id}|${i}" aria-label="Mark this reading as a mistake">Mistake?</button>` : ''}</td></tr>`).join('')}</tbody></table>` : '<p class="small mut">No readings yet.</p>'}</div>`;
-  }).join('')}</div>`;
-  return h;
-}
-
-function methodPicker(j) {
-  return `<section class="card picker"><h3>How is this main being disinfected?</h3><p class="small mut">You can change it later. Nothing you’ve entered is lost.</p>
-<div class="pick"><button data-sel="rounds.0.method" data-v="tablets"><b>Tablets</b><span>PWD Initial Sample Request</span></button><button data-sel="rounds.0.method" data-v="cf"><b>Continuous feed</b><span>Disinfection Form (Pre and Post) and Chlorine Verification Logs</span></button></div></section>`;
-}
-function formName(j, ri) {
-  const m = methodOf(j, ri);
-  if (ri === 0) return m === 'cf' ? 'PWD Disinfection Form (Continuous Feed) and Chlorine Verification Logs' : 'PWD Initial Sample Request';
-  return 'PWD Resample Request' + (m === 'cf' ? ', plus the Continuous Feed form and logs' : '');
-}
-function steps(j) {
-  const ri = V.ri != null && j.rounds[V.ri] ? V.ri : cur(j), c = ctx(j, ri), rd = c.rd;
-  let h = '';
-  if (j.rounds.length > 1) h += `<div class="rounds">${j.rounds.map((r, i) => `<a href="#/job/${j.id}/steps/${i}" class="${i === ri ? 'on' : ''}">${roundName(i)}</a>`).join('')}</div>`;
-  if (ri !== cur(j)) h += `<div class="banner"><p>You’re looking at the ${roundName(ri)} steps from earlier. Timers and the email use the latest round.</p></div>`;
-  if (status(j)[1] === 'bad' && ri === cur(j)) h += `<div class="banner bad"><p><b>The last sample failed.</b> Start a resolution round to record the lab’s fix and the work done.</p><div class="acts"><button class="btn red" data-act="resample">Start resolution round</button></div></div>`;
-  if (ri === 0 && !rd.method) return h + methodPicker(j);
-  const m = methodOf(j, ri);
-  h += `<p class="small mut" style="margin:0 0 12px">${esc(formName(j, ri))}${m && m !== 'flush' ? ` · Hold: ${c.holdH} hours${c.holdH === 48 ? ' (water below 41°F)' : ''}` : ''}${ri === 0 ? ` · <button class="lk" data-act="unmethod">Change method</button>` : ''}</p>`;
-  return h + groups(j, ri).map(g => { const body = g.items.map(it => itemHtml(c, it)).join(''); return body ? `<section class="grp ${g.live ? 'live' : ''}"><h3>${esc(g.g)}</h3>${body}</section>` : ''; }).join('');
-}
-
-/* --- job info --- */
-function infoVal(j, k) { return k.startsWith('R.') ? getP(j.rounds[cur(j)], k.slice(2)) : getP(j, k); }
-function infoPath(j, k) { return k.startsWith('R.') ? `rounds.${cur(j)}.${k.slice(2)}` : k; }
 function info(j) {
-  return `<div class="form">${RULES.jobFields.map(f => {
-    const p = infoPath(j, f.k), id = 'f-' + p.replace(/\./g, '-'), v = infoVal(j, f.k) ?? '';
-    return `<div class="${v === '' && !f.opt ? 'blank' : ''}"><label for="${id}">${esc(f.l)}${f.opt ? ' <span class="small">(for the forms)</span>' : ''}</label><input id="${id}" data-k="${p}" ${f.type ? `type="${f.type}"` : ''} ${f.type === 'number' ? 'inputmode="decimal" step="any"' : ''} value="${esc(v)}"></div>`;
-  }).join('')}</div>
-<p class="sample">Fields outlined in amber are needed for the sample request email. The three date/time fields are the same ones as in Steps${j.rounds.length > 1 ? `, for the ${roundName(cur(j))} round` : ''}.</p>
-<p style="margin-top:28px"><button class="btn red" data-del="1">Delete this street</button></p>`;
+  return `<div class="form">${FIELDS.map(([k, l, t]) => `<div><label for="${fid(k)}">${l}</label><input id="${fid(k)}" data-k="${k}" ${t ? `type="${t}"` : ''} ${t === 'number' ? 'inputmode="decimal" step="any"' : ''} value="${esc(get(j, k))}"></div>`).join('')}</div>
+<p style="margin-top:24px"><button class="btn red" id="del" data-del="${j.id}">Delete this street</button></p>`;
 }
-
-/* --- lab results --- */
 function labs(j) {
-  const rows = j.labs.map((a, i) => {
-    const e = labEval(j, a), b = ctx(j, a.ri).baseline, multi = disCount(j, a.ri) > 1, pfx = `labs.${i}.`;
-    return `<div class="lab"><h3><span>${roundName(a.ri)}${j.labs.filter(x => x.ri === a.ri).length > 1 ? ` <span class="mut" style="font-size:16px">${esc(a.point || '')}</span>` : ''}</span>${e.pass === true ? '<span class="b ok">Passed</span>' : e.pass === false ? `<span class="b bad wrap">Failed: ${esc(e.fails.join(', '))}</span>` : `<span class="b warn">${e.missing} result${e.missing === 1 ? '' : 's'} still blank</span>`}</h3>
-<div class="meta"><div><label for="l${i}d">Sample date</label><input id="l${i}d" type="date" data-k="${pfx}date" value="${esc(a.date)}"></div><div><label for="l${i}p">Sample point</label><input id="l${i}p" data-k="${pfx}point" value="${esc(a.point || '')}" placeholder="e.g. ferrule at Dover & Somerset"></div></div>
-<table class="stack"><thead><tr><th>Test</th><th>Acceptable</th><th>Result</th><th></th></tr></thead><tbody>${RULES.lab.map(p => {
-      const n = num(a[p.k]), ok = n === null ? '' : p.ok(n, b, multi), id = `l${i}-${p.k}`;
-      const ctl = p.presence
-        ? `<select id="${id}" data-k="${pfx}${p.k}" aria-label="${p.name}"><option value=""${a[p.k] == null || a[p.k] === '' ? ' selected' : ''}>—</option><option value="0"${a[p.k] === '0' ? ' selected' : ''}>0, absent</option><option value="1"${a[p.k] === '1' ? ' selected' : ''}>1, present</option></select>`
-        : `<input id="${id}" data-k="${pfx}${p.k}" type="number" step="any" inputmode="decimal" value="${esc(a[p.k] ?? '')}" aria-label="${p.name}">`;
-      return `<tr><td><b>${p.name}</b> <span class="mut">${p.u}</span></td><td>${esc(p.range(b, multi))}</td><td>${ctl}</td><td>${ok === '' ? '' : ok ? '<span class="b ok">OK</span>' : '<span class="b bad">Fail</span>'}</td></tr>`;
-    }).join('')}</tbody></table>
-<button class="btn ghost sm" data-labdel="${i}">Delete this result</button></div>`;
+  const L = j.labs;
+  const h = L.map((a, i) => {
+    const r = labRes(a, j, i);
+    return `<div class="lab"><h3><span>${labName(i)} <input type="date" data-k="labs.${i}.date" id="in-lab${i}-date" value="${esc(a.date)}" style="width:auto;display:inline-block;margin-left:8px" aria-label="Sample date"></span>${r.pass === true ? '<span class="b ok">Passed</span>' : r.pass === false ? `<span class="b bad">Failed: ${esc(r.fails.join(', '))}</span>` : '<span class="b warn">Enter all results</span>'}</h3>
+<table class="stack"><thead><tr><th>Parameter</th><th>Acceptable</th><th>Result</th><th></th></tr></thead><tbody>${P.map(p => {
+      const n = num(a[p[0]]), ok = n == null ? '' : p[4](n, j, i), id = `in-lab${i}-${p[0]}`;
+      const ctl = p[2] === '0 or 1' ? `<select id="${id}" data-k="labs.${i}.${p[0]}" aria-label="${p[1]}"><option value=""${a[p[0]] === '' ? ' selected' : ''}>—</option><option value="0"${a[p[0]] === '0' ? ' selected' : ''}>0, absent</option><option value="1"${a[p[0]] === '1' ? ' selected' : ''}>1, present</option></select>`
+        : `<input id="${id}" data-k="labs.${i}.${p[0]}" type="number" step="any" inputmode="decimal" value="${esc(a[p[0]])}" aria-label="${p[1]}">`;
+      return `<tr><td><b>${p[1]}</b> <span class="mut">${p[2]}</span></td><td>${p[3](i)}</td><td>${ctl}</td><td>${ok === '' ? '' : ok ? '<span class="b ok">OK</span>' : '<span class="b bad">Fail</span>'}</td></tr>`;
+    }).join('')}</tbody></table></div>`;
   }).join('');
-  const ri = cur(j);
-  let act = `<button class="btn" data-addlab="1">Add ${roundName(ri)} sample result</button>`;
-  if (status(j)[1] === 'bad') act += ` <button class="btn red" data-act="resample">Start resolution round</button>`;
-  return (rows || '<p class="mut">No lab results yet. Add them when BLS sends the report. Add one result for each sample point.</p>') + `<div class="btns">${act}</div>`;
+  return (h || '<p class="mut">No lab results yet. Add them when BLS emails the report.</p>') + `<button class="btn" data-addlab="1">${L.length ? 'Add resample result' : 'Add initial result'}</button>`;
 }
 
-/* --- email --- */
+/* Which request this email is for: Initial, then Resample 1, 2, 3 after each failed result. */
+function autoReq(j) { const L = j.labs; if (!L.length) return 0; return labRes(L[L.length - 1], j, L.length - 1).pass === false ? L.length : L.length - 1; }
+const reqOf = j => (j.mailReq === '' || j.mailReq == null ? autoReq(j) : +j.mailReq);
 function mailParts(j) {
-  const ri = cur(j), rd = j.rounds[ri], rs = isRs(ri), flushOnly = methodOf(j, ri) === 'flush';
-  const list = S.settings.recipients.filter(e => !j.mail.off.includes(e));
-  const extra = [j.f.contractorEmail, ...j.mail.extra].filter(Boolean).filter(e => !j.mail.off.includes(e));
-  const to = [...new Set([...list, ...extra])];
-  const subject = RULES.subject(rs, j.f.work);
-  const loc = j.street ? `On ${j.street}${j.from ? `, from ${j.from}` : ''}${j.to ? ` to ${j.to}` : ''}` : '';
-  const body = RULES.emailBody.map(([label, k, kind]) => {
-    let v = k === 'location' ? (j.street && j.from && j.to ? loc : '') : k.startsWith('R.') ? getP(rd, k.slice(2)) : getP(j, k);
-    if (kind === 'date') v = mdy(v); else if (kind === 'dt') v = mdy(v, true);
-    if (k === 'R.t.loaded' && !v && flushOnly) v = `N/A (flush only; last loaded ${prevLoaded(j, ri) || 'earlier'})`;
-    return [label, v ?? '', k];
+  const f = j.f, ri = reqOf(j);
+  const to = S.settings.recipients.concat(f.contractorEmail ? [f.contractorEmail] : []).join('; ');
+  const sub = `Water Sample, ${labName(ri)} Request (${f.work || 'Work #'})`;
+  const body = [['Sample Date Requested', mdy(f.sampleDate)], ['Contractor', f.contractor], ['Work #', f.work], ['Inspector', f.inspector], ['Inspector Phone #', f.phone], ['Division Engineer', f.engineer], ['Division Engineer Email', f.engEmail], ['Street Location of Main', `On ${j.street}, from ${j.from} to ${j.to}`], ['# of Flushing Locations', f.nFlush], ['Flushing Location', f.flushLoc], ['# of Samples Requested', f.nSamples], ['Length (feet)', f.length], ['Diameter (inches)', f.dia], ['Flushing Pipe Size (inches)', f.flushPipe], ['Date/Time Loaded for Disinfection', mdy(j.t.loaded)], ['Date/Time Flushing Started', mdy(j.t.flushStart)], ['Date/Time of Shutdown for Sanitary Release Testing', mdy(j.t.shutdown)]];
+  return { ri, to, sub, body, txt: body.map(b => b[0] + ': ' + (b[1] || '')).join('\n'), miss: body.filter(b => !b[1]).map(b => b[0]) };
+}
+function mail(j) {
+  const m = mailParts(j), n = Math.max(j.labs.length, m.ri) + 1;
+  const opts = `<option value=""${j.mailReq === '' ? ' selected' : ''}>Automatic (${labName(autoReq(j))})</option>` + Array.from({ length: n }, (_, i) => `<option value="${i}"${j.mailReq !== '' && +j.mailReq === i ? ' selected' : ''}>${labName(i)}</option>`).join('');
+  return `<div class="mail">${m.miss.length ? `<p class="b warn" style="white-space:normal">Still blank: ${esc(m.miss.join(', '))}</p>` : '<p class="b ok">Every required field is filled in</p>'}
+<label for="m-req">Request</label><select id="m-req" data-req="1">${opts}</select>
+<label>To</label><pre id="m-to">${esc(m.to) || '<span class="mut">No recipients yet. Add the PWD list once under “Email recipients” on the Streets screen.</span>'}</pre><button class="btn ghost" data-copy="m-to">Copy recipients</button>
+<label>Subject</label><pre id="m-sub">${esc(m.sub)}</pre><button class="btn ghost" data-copy="m-sub">Copy subject</button>
+<label>Body</label><pre id="m-body">${esc(m.txt)}</pre><button class="btn ghost" data-copy="m-body">Copy body</button>
+<p class="sample">Paste these into your email app. After shutdown, reply all to BLS's acknowledgement with the signed form and sketch as a PDF.</p></div>`;
+}
+
+/* Mini analysis for one street */
+function jobAn(j) {
+  const T = s => parse(s)?.getTime() ?? null;
+  const ld = T(j.t.loaded), fs = T(j.t.flushStart), sd = T(j.t.shutdown), rel = released(j);
+  const ev = [];
+  const add = (label, t, note, todo) => ev.push({ label, t, note, todo });
+  add('Main loaded', ld, ld ? fmt(new Date(ld)) : 'Not entered yet', !ld);
+  add(`${holdH(j)}-hour hold done`, ld ? ld + holdH(j) * 3600e3 : null, ld ? fmt(new Date(ld + holdH(j) * 3600e3)) : 'After loading', !ld || ld + holdH(j) * 3600e3 > Date.now());
+  add('Flushing started', fs, fs ? fmt(new Date(fs)) + (ld ? ` · ${dur(fs - ld)} after loading` : '') : 'Not entered yet', !fs);
+  add('Shut down for 16-hour hold', sd, sd ? fmt(new Date(sd)) + (fs ? ` · flushed ${dur(sd - fs)}` : '') : 'Not entered yet', !sd);
+  let prev = sd;
+  j.labs.forEach((a, i) => {
+    const t = T(a.date), r = labRes(a, j, i);
+    const res = r.pass === true ? 'Passed' : r.pass === false ? 'Failed: ' + r.fails.join(', ') : 'Results not complete';
+    add(i ? labName(i) : 'Initial sample', t, (t ? new Date(t).toLocaleDateString() : 'No date') + ` · ${res}` + (t && prev ? ` · ${dur(t - prev)} after ${i ? 'last sample' : 'shutdown'}` : ''), false);
+    if (t) prev = t;
   });
-  return { to, subject, body, text: body.map(b => `${b[0]}: ${b[1]}`).join('\n'), missing: body.filter(b => !b[1]), rs };
-}
-function email(j) {
-  const m = mailParts(j), fl = flags(j, cur(j));
-  const warn = [];
-  if (m.missing.length) warn.push(`<b>Still blank:</b> ${m.missing.map(b => `<a href="#/job/${j.id}/info" data-focus="${esc(b[2] === 'location' ? 'from' : infoPath(j, b[2]))}">${esc(b[0])}</a>`).join(', ')}`);
-  if (fl.red) warn.push(`<b>${fl.red} step${fl.red === 1 ? ' is' : 's are'} red</b> in Steps${fl.needFix ? `, and ${fl.needFix} still need${fl.needFix === 1 ? 's' : ''} a corrective action note` : ''}.`);
-  if (usesCf(j, cur(j)) && j.rounds[cur(j)].cf && j.rounds[cur(j)].c && getP(j.rounds[cur(j)], 'cf.logsSent') !== 'Y') warn.push('<b>Chlorine Verification Logs:</b> send them to the PWD lab before sanitary release sampling.');
-  if (!m.to.length) warn.push(S.settings.recipients.length ? '<b>No recipients selected.</b>' : '<b>No recipients yet.</b> Add the PWD list once under <a href="#/settings">Backup</a> &gt; Email recipients.');
-  const all = [...new Set([...S.settings.recipients, ...[j.f.contractorEmail, ...j.mail.extra].filter(Boolean)])];
-  const mailto = `mailto:${m.to.map(encodeURIComponent).join(',')}?subject=${encodeURIComponent(m.subject)}&body=${encodeURIComponent(m.text.replace(/\n/g, '\r\n'))}`;
-  return `<div class="mail">${warn.length ? `<div class="banner warn"><p>${warn.join('<br>')}</p></div>` : '<div class="banner"><p><b>Every required field is filled in.</b></p></div>'}
-<div class="btns"><a class="btn" href="${esc(mailto)}">Open in my email app</a><button class="btn ghost" data-copy="all">Copy everything</button></div>
-<h3>To <span class="mut" style="font-size:15px">(${m.to.length})</span></h3>
-<div>${all.map(e => { const isC = e === j.f.contractorEmail, isX = j.mail.extra.includes(e); return `<label class="rcp"><input type="checkbox" data-rcp="${esc(e)}" ${j.mail.off.includes(e) ? '' : 'checked'}><span>${esc(e)}${isC ? ' <span class="mut small">(contractor)</span>' : ''}</span>${isX ? `<button data-rcpdel="${esc(e)}" aria-label="Remove ${esc(e)}">Remove</button>` : ''}</label>`; }).join('')}</div>
-<form class="addrow" id="rcpf"><input id="rcp-new" type="email" placeholder="Add another address for this street" aria-label="Add an address"><button class="btn ghost">Add</button></form>
-<p class="sample">Untick anyone who shouldn’t get this one. The PWD list itself is under Backup. The contractor email comes from Job info.</p>
-<div class="btns"><button class="btn ghost sm" data-copy="to">Copy recipients</button></div>
-<h3>Subject</h3><pre>${esc(m.subject)}</pre><div class="btns"><button class="btn ghost sm" data-copy="subject">Copy subject</button></div>
-<h3>Body</h3><pre>${esc(m.text)}</pre><div class="btns"><button class="btn ghost sm" data-copy="body">Copy body</button></div>
-<p class="sample">After shutdown, reply all to BLS’s acknowledgement with the signed form and sketch as one PDF.</p></div>`;
-}
+  const rt = rel ? T(rel.date) : null;
+  add('Released', rt, rel ? `${new Date(rt).toLocaleDateString()} · passed on ${labName(rel.i).toLowerCase()}` : 'Waiting for a passing result', !rel);
+  const total = ld && rt ? `<p><b>Loaded to released:</b> ${dur(rt - ld)} (lab dates have no time, so this counts to midnight of the sample day)</p>` : '';
 
-/* --- notes: a running log, never overwritten --- */
-const allTags = () => [...new Set([...RULES.tags, ...S.settings.tags])];
-const STAGE_OF = { 'Getting ready': 'Setup', Disinfecting: 'Disinfecting', '24-hr hold': 'Disinfecting', Flushing: 'Flushing', '16-hr hold': '16-hr hold', 'Waiting on lab': 'Waiting on lab', 'Failed: fix needed': 'Resolution', Resolution: 'Resolution' };
-function noteEntry(j, n) {
-  return `<li class="ne"><div class="nh"><b>${esc(mdyMs(n.t, true))}</b>${j.rounds.length > 1 ? ` <span class="b">${roundName(n.ri || 0)}</span>` : ''}${n.stage ? ` <span class="b prog">${esc(n.stage)}</span>` : ''}${(n.tags || []).map(t => ` <span class="b tag">${esc(t)}</span>`).join('')}</div><div class="nt">${esc(n.text)}</div></li>`;
-}
-function notes(j) {
-  const fx = [];
-  j.rounds.forEach((r, i) => { const c = ctx(j, i); for (const it of items(c)) if (itemState(c, it) === 'bad') fx.push([i, txt(it.q, c), r.fix[fixKey(it.k)] || '']); });
-  const stage = STAGE_OF[status(j)[0]] || '';
-  return `<form id="notef" class="card notef"><h3>Add a note</h3><label for="n-text" class="small mut">What happened? Each note is stamped with the date and time and can’t be changed later. To correct one, add another.</label>
-<textarea id="n-text" required></textarea>
-<div class="nrow"><label class="small mut" for="n-stage">Stage</label><select id="n-stage"><option value="">—</option>${RULES.stages.map(s => `<option${s === stage ? ' selected' : ''}>${esc(s)}</option>`).join('')}</select></div>
-<div class="tags" role="group" aria-label="Tags">${allTags().map(t => `<label class="tg"><input type="checkbox" name="tag" value="${esc(t)}"><span>${esc(t)}</span></label>`).join('')}<input id="n-newtag" placeholder="+ New tag" aria-label="New tag" class="newtag"></div>
-<div class="btns"><button class="btn">Add note</button></div></form>
-<h3 style="font-size:20px;margin:8px 0">Log <span class="mut" style="font-size:15px">(${j.log.length})</span></h3>
-${j.log.length ? `<ul class="nlog">${j.log.slice().sort((a, b) => b.t - a.t).map(n => noteEntry(j, n)).join('')}</ul>` : '<p class="mut">No notes yet.</p>'}
-${fx.length ? `<h3 style="font-size:20px;margin:20px 0 8px">Corrective actions from Steps</h3>${fx.map(([i, q, f]) => `<div class="note ${f.trim() ? '' : 'warn'}"><b>${j.rounds.length > 1 ? roundName(i) + ': ' : ''}${esc(q)}</b><br>${f.trim() ? esc(f) : '<i>No corrective action written yet. Add it under Steps.</i>'}</div>`).join('')}` : ''}`;
-}
+  const rowC = (label, v, target, ok) => { const n = num(v); return `<tr><td><b>${label}</b></td><td>${n == null ? '<span class="mut">—</span>' : esc(v) + ' ppm'}</td><td>${target}</td><td>${n == null ? '' : ok(n) ? '<span class="b ok">OK</span>' : '<span class="b bad">Off target</span>'}</td></tr>`; };
+  const rows = [rowC('Source water total (baseline)', j.r.srcTotal, '1.0 or more', v => v >= 1),
+    rowC('Free after tablets dissolve', j.r.dissolve, '25 or more', v => v >= 25),
+    rowC(`Free after ${holdH(j)}-hour hold`, j.r.hold, '10 or more', v => v >= 10),
+    rowC('Free after flushing', j.r.afterFlush, '0.10 or less', v => v <= 0.1),
+    rowC('Total after refill', j.r.refill, 'Above 1.0, within 0.5 of baseline', v => totalOk(v, j))];
+  j.labs.forEach((a, i) => { rows.push(rowC(`${labName(i)}: free (lab)`, a.free, '0.10 or less', v => v <= 0.1)); rows.push(rowC(`${labName(i)}: total (lab)`, a.total, 'Above 1.00, within 0.50 of main', v => totalOk(v, j))); });
 
-/* --- print menu --- */
-function printMenu(j) {
-  const rows = j.rounds.map((r, i) => {
-    const m = methodOf(j, i), L = [];
-    if (i === 0 && m === 'tablets') L.push(['initial', 'Initial Sample Request']);
-    if (i > 0) L.push(['resample', 'Resample Request']);
-    if (m === 'cf') L.push(['cfpre', 'Disinfection Form: Pre-Disinfection'], ['cfpost', 'Disinfection Form: Post-Disinfection'], ['cflog', 'Chlorine Verification Logs (every point)']);
-    return `<div class="card"><h3>${roundName(i)} <span class="mut" style="font-size:16px">${esc(methodLabel(m))}${i ? ` · ${esc(RULES.fixes[r.res.fix] || 'fix not picked')}` : ''}</span></h3>${L.length ? `<div class="btns">${L.map(([k, l]) => `<a class="btn ghost" href="#/print/${j.id}/${k}/${i}">${l}</a>`).join('')}</div>` : '<p class="small mut">Pick the method in Steps first.</p>'}</div>`;
-  }).join('');
-  return `<p class="mut">Each one opens a printable page. Use <b>Print / Save as PDF</b> there. On a phone, choose “Save as PDF” as the printer.</p>
-<div class="card"><h3>Street report</h3><p class="small mut">Everything on this street: steps, logs, lab results and notes.</p><div class="btns"><a class="btn" href="#/print/${j.id}/report/0">Street report</a></div></div>${rows}
-<p class="sample">The PWD form printouts follow the layout of the forms in hand. Check them against the official form before signing.</p>`;
+  const res = j.labs.map((a, i) => labRes(a, j, i)), nPass = res.filter(r => r.pass === true).length, nFail = res.filter(r => r.pass === false).length;
+  const cnt = {}; res.forEach(r => r.fails.forEach(f => (cnt[f] = (cnt[f] || 0) + 1)));
+  const v = (x, u) => (x === '' || x == null ? '—' : esc(x) + (u || ''));
+  return `<div class="kpis"><div class="kpi"><strong>${j.labs.length}</strong><span>Samples taken</span></div><div class="kpi"><strong>${nFail}</strong><span>Failed</span></div><div class="kpi"><strong>${v(j.r.waterT, '°')}</strong><span>Water °F</span></div><div class="kpi"><strong>${v(j.r.airT, '°')}</strong><span>Air °F</span></div></div>
+<p><b>Weather:</b> ${v(j.r.weather)} · <b>Hold:</b> ${holdH(j)} hrs · <b>Tablets:</b> ${v(j.r.tablets)} · <b>Granules:</b> ${j.r.granules === 'Y' ? 'Yes' : j.r.granules === 'N' ? 'No' : '—'}${Object.keys(cnt).length ? ` · <b>Failed on:</b> ${esc(Object.entries(cnt).map(([k, n]) => n > 1 ? `${k} (${n})` : k).join(', '))}` : ''}</p>
+<h3 class="h3" style="margin-top:18px">Timeline</h3>
+<ol class="tl">${ev.map(e => `<li class="${e.todo ? 'todo' : ''}"><b>${e.label}</b><small>${esc(e.note)}</small></li>`).join('')}</ol>${total}
+<h3 class="h3" style="margin-top:18px">Chlorine readings vs targets</h3>
+<table class="stack"><thead><tr><th>Reading</th><th>Result</th><th>Target</th><th></th></tr></thead><tbody>${rows.join('')}</tbody></table>`;
 }
 
 function detail(j) {
-  const [s, c] = status(j), fl = flags(j, cur(j));
-  const secs = [['steps', 'Steps'], ['info', 'Job info'], ['lab', 'Lab results'], ['email', 'Email'], ['notes', 'Notes'], ['print', 'Print']];
-  const body = { steps, info, lab: labs, email, notes, print: printMenu }[V.sec] || steps;
-  return `<a class="back" href="#/">← All streets</a><h2 style="font-size:clamp(28px,5vw,40px)">${esc(j.street)}</h2>
-<div class="mut">${esc([j.from, j.to].filter(Boolean).join(' to '))}${j.f.work ? ` · Work #${esc(j.f.work)}` : ''}${j.f.length || j.f.dia ? ` · ${esc(j.f.length || '?')} ft of ${esc(j.f.dia || '?')}"` : ''}</div>
-<div class="sum"><span class="b ${c}">${s}</span>${fl.total ? `<span class="b">${fl.filled} of ${fl.total} steps filled</span>` : ''}${fl.red ? `<span class="b bad">${fl.red} red</span>` : ''}${fl.needFix ? `<span class="b bad">${fl.needFix} need a corrective action</span>` : ''}</div>
-<nav class="secs" aria-label="Sections">${secs.map(([k, l]) => `<a href="#/job/${j.id}/${k}" class="${V.sec === k ? 'on' : ''}" ${V.sec === k ? 'aria-current="page"' : ''}>${l}</a>`).join('')}</nav>${body(j)}`;
+  const [s, c] = status(j), pr = progress(j), secs = [['info', 'Job info'], ['steps', 'Steps'], ['lab', 'Lab results'], ['email', 'Email'], ['notes', 'Notes'], ['an', 'Analysis']];
+  let body = '';
+  if (V.sec === 'steps') body = G.map(g => `<section class="grp"><h3>${g.g}</h3>${g.items.map(it => item(j, it)).join('')}</section>`).join('');
+  else if (V.sec === 'lab') body = labs(j); else if (V.sec === 'email') body = mail(j);
+  else if (V.sec === 'notes') body = `<label for="in-notes" class="mut">Notes, corrective actions, anything unusual</label><textarea id="in-notes" data-k="notes">${esc(j.notes)}</textarea>`;
+  else if (V.sec === 'an') body = jobAn(j) + footer();
+  else body = info(j);
+  return `<button class="back" data-go="home">← All streets</button><h2 style="font-size:clamp(28px,5vw,40px)">${esc(j.street)}</h2><div class="mut">${esc(j.from)} to ${esc(j.to)} · Work #${esc(j.f.work)} · ${esc(j.f.length || '?')} ft of ${esc(j.f.dia || '?')}"</div>
+<div class="sum"><span class="b ${c}">${s}</span><span class="b">${pr.d} of ${pr.n} steps filled</span>${pr.b ? `<span class="b bad">${pr.b} flagged</span>` : ''}<span class="b">Hold: ${holdH(j)} hrs</span></div>
+<div class="secs" role="tablist">${secs.map(([k, l]) => `<button role="tab" data-sec="${k}" class="${V.sec === k ? 'on' : ''}" aria-selected="${V.sec === k}">${l}</button>`).join('')}</div>${body}`;
 }
 
-/* --- analysis --- */
-function rateTable(title, groupsMap) {
-  const rows = Object.entries(groupsMap).sort((a, b) => b[1].n - a[1].n);
-  return `<h3 class="ah">${esc(title)}</h3>${rows.length ? `<table class="stack rt"><thead><tr><th></th><th>Rounds with a result</th><th>Passed</th><th>Pass rate</th></tr></thead><tbody>${rows.map(([k, v]) => `<tr><td><b>${esc(k)}</b></td><td>${v.n}</td><td>${v.p}</td><td><b>${Math.round(100 * v.p / v.n)}%</b></td></tr>`).join('')}</tbody></table>` : '<p class="mut">Nothing yet.</p>'}`;
-}
-function whoDid(j, ri) {
-  const rd = j.rounds[ri];
-  if (ri === 0) return j.f.disSub ? `${j.f.disSub} (sub-contractor)` : 'Contractor in-house';
-  return rd.res.by === 'sub' ? `${rd.res.subCo || 'Sub-contractor'} (sub-contractor)` : rd.res.by === 'inhouse' ? 'Contractor in-house' : 'Not recorded';
-}
-function rangeData(from, to) {
-  const a = parseLocal(from), b = parseLocal(to), lo = a ? a.getTime() : -Infinity, hi = b ? b.getTime() + DAY - 1 : Infinity;
-  const inR = t => t >= lo && t <= hi, tags = {}, streets = [];
-  for (const j of S.jobs) {
-    const lab = j.labs.map((l, i) => ({ l, i, t: parseLocal(l.date)?.getTime() })).filter(x => x.t != null && inR(x.t));
-    const notes = j.log.filter(n => inR(n.t));
-    for (const n of notes) for (const t of n.tags || []) tags[t] = (tags[t] || 0) + 1;
-    if (lab.length || notes.length) streets.push({ j, lab, notes });
-  }
-  return { streets, tags };
-}
-function rangeReportHtml(from, to) {
-  const { streets, tags } = rangeData(from, to);
-  const head = `<p class="mut">${from || to ? `${from ? mdy(from) : 'The start'} to ${to ? mdy(to) : 'today'}` : 'All dates'} · ${streets.length} street${streets.length === 1 ? '' : 's'}</p>`;
-  const tagH = Object.keys(tags).length ? `<h3 class="ah">Tags</h3><div class="tagc">${Object.entries(tags).sort((a, b) => b[1] - a[1]).map(([t, n]) => `<span class="b tag">${esc(t)}: ${n}</span>`).join(' ')}</div>` : '';
-  const body = streets.map(({ j, lab, notes }) => `<div class="rs"><h4>${esc(j.street)} <span class="mut small">${esc([j.from, j.to].filter(Boolean).join(' to '))}${j.f.work ? ` · Work #${esc(j.f.work)}` : ''}</span></h4>
-${lab.length ? `<ul>${lab.map(({ l }) => { const e = labEval(j, l); return `<li>${esc(mdy(l.date))}: ${roundName(l.ri)}${l.point ? ` (${esc(l.point)})` : ''}, ${esc(methodLabel(methodOf(j, l.ri)))}${l.ri ? `, ${esc(RULES.fixes[j.rounds[l.ri].res.fix] || 'fix not recorded')}` : ''}: ${e.pass === true ? '<b class="okt">Passed</b>' : e.pass === false ? `<b class="badt">Failed</b> (${esc(e.fails.join(', '))})` : 'incomplete'}</li>`; }).join('')}</ul>` : ''}
-${notes.length ? `<ul class="nlog">${notes.slice().sort((a, b) => a.t - b.t).map(n => noteEntry(j, n)).join('')}</ul>` : ''}</div>`).join('');
-  return head + tagH + (body || '<p class="mut">Nothing in this date range.</p>');
-}
-function analysis() {
-  const D = S.jobs.filter(j => roundResult(j, 0) === true || roundResult(j, 0) === false);
-  const first = j => roundResult(j, 0) === true;
-  const rate = a => (a.length ? Math.round(100 * a.filter(first).length / a.length) + '%' : '—');
-  const wt = j => num(j.rounds[0].r.waterT);
-  const cold = D.filter(j => wt(j) !== null && wt(j) < RULES.coldF), warm = D.filter(j => wt(j) !== null && wt(j) >= RULES.coldF);
-  const samples = j => new Set(j.labs.map(l => l.ri)).size;
-  const tries = D.length ? (D.reduce((s, j) => s + samples(j), 0) / D.length).toFixed(1) : '—';
-  const cnt = {}; for (const j of S.jobs) for (const l of j.labs) for (const f of labEval(j, l).fails) cnt[f] = (cnt[f] || 0) + 1;
-  const mx = Math.max(1, ...Object.values(cnt));
-  const byFix = {}, byMethod = {}, byWho = {};
-  const add = (m, k, p) => { m[k] ??= { n: 0, p: 0 }; m[k].n++; if (p) m[k].p++; };
-  for (const j of S.jobs) j.rounds.forEach((r, ri) => {
-    const rr = roundResult(j, ri); if (rr !== true && rr !== false) return;
-    add(byMethod, methodLabel(methodOf(j, ri)), rr);
-    add(byWho, whoDid(j, ri), rr);
-    if (ri > 0) add(byFix, RULES.fixes[r.res.fix] || 'Not recorded', rr);
-  });
-  const R = S.meta.range;
-  return `<div class="top"><h2>What makes samples pass</h2><span class="mut">${D.length} main${D.length === 1 ? '' : 's'} with a first lab result</span></div>
-${D.length ? '' : '<div class="banner"><p>This page fills in as lab results are entered. Nothing to show yet.</p></div>'}
-<div class="kpis"><div class="kpi"><strong>${rate(D)}</strong><span>Passed on the first sample</span></div><div class="kpi"><strong>${tries}</strong><span>Samples per main, on average</span></div><div class="kpi"><strong>${rate(cold)}</strong><span>First-try pass, water below 41°F (${cold.length})</span></div><div class="kpi"><strong>${rate(warm)}</strong><span>First-try pass, water 41°F and up (${warm.length})</span></div></div>
-${rateTable('Pass rate by method', byMethod)}
-${rateTable('Pass rate by fix type (resolution rounds)', byFix)}
-${rateTable('Pass rate by who did the work', byWho)}
-<h3 class="ah">Which tests fail most</h3><div class="bars">${Object.keys(cnt).length ? Object.entries(cnt).sort((a, b) => b[1] - a[1]).map(([k, v]) => `<div class="bar"><span>${esc(k)}</span><div><i style="width:${100 * v / mx}%"></i></div><span>${v}</span></div>`).join('') : '<p class="mut">No failed tests logged yet.</p>'}</div>
-<section class="card"><h3>Report for a date range</h3><p class="small mut">Each street’s lab results and notes in the period, with a count of each tag.</p>
-<div class="range"><label>From<input type="date" id="rg-from" data-mk="range.from" value="${esc(R.from || '')}"></label><label>To<input type="date" id="rg-to" data-mk="range.to" value="${esc(R.to || '')}"></label><a class="btn ghost" href="#/print/range">Print this report</a></div>
-${rangeReportHtml(R.from, R.to)}</section>
-<h3 class="ah">Every main</h3>${S.jobs.length ? `<div class="scroll"><table class="stack"><thead><tr><th>Street</th><th>Work #</th><th>Length</th><th>Dia.</th><th>Method</th><th>Water °F</th><th>Pipe maker</th><th>Samples</th><th>First sample</th><th>Status</th></tr></thead><tbody>${S.jobs.map(j => {
-    const [s, c] = status(j), r0 = j.rounds[0].r, fr = roundResult(j, 0);
-    return `<tr><td><a href="#/job/${j.id}/steps"><b>${esc(j.street)}</b></a></td><td>${esc(j.f.work)}</td><td>${j.f.length ? esc(j.f.length) + ' ft' : ''}</td><td>${j.f.dia ? esc(j.f.dia) + '"' : ''}</td><td>${methodOf(j, 0) ? esc(methodLabel(methodOf(j, 0))) : ''}</td><td>${esc(r0.waterT)}</td><td>${esc(j.f.mfr)}</td><td>${samples(j) || ''}</td><td>${fr === true ? '<span class="b ok">Pass</span>' : fr === false ? '<span class="b bad">Fail</span>' : ''}</td><td><span class="b ${c}">${s}</span>${cur(j) ? ` <span class="small mut">${roundName(cur(j))}</span>` : ''}</td></tr>`;
-  }).join('')}</tbody></table></div>` : '<p class="mut">No streets yet.</p>'}`;
-}
-
-/* --- printable pages --- */
-function ansText(c, it) {
-  const v = val(c, it.k);
-  if (v == null || v === '') return '';
-  if (it.t === 'yn') return v === 'Y' ? 'Yes' : 'No';
-  if (it.t === 'time') return mdy(v, true);
-  if (it.t === 'date') return mdy(v);
-  if (it.t === 'sel') return (it.opts.find(o => o[0] === v) || [, v])[1];
-  if (it.t === 'num') return `${v} ${it.u || ''}`.trim();
-  return v;
-}
-function streetReport(j) {
-  const F = [['Location', [j.from, j.to].filter(Boolean).join(' to ')], ['Work #', j.f.work], ['Contract No.', j.f.contract], ['Contractor', j.f.contractor], ['Disinfection sub-contractor', j.f.disSub], ['Inspector', j.f.inspector], ['Division engineer', j.f.engineer], ['Length', j.f.length && j.f.length + ' ft'], ['Diameter', j.f.dia && j.f.dia + ' in'], ['Pipe manufacturer', j.f.mfr], ['Status', status(j)[0]]].filter(x => x[1]);
-  const rounds = j.rounds.map((rd, ri) => {
-    const c = ctx(j, ri), m = methodOf(j, ri);
-    const rows = groups(j, ri).map(g => {
-      const its = g.items.filter(it => it.k && vis(c, it) && ansText(c, it));
-      return its.length ? `<tr><th colspan="2" class="gh">${esc(g.g)}</th></tr>${its.map(it => { const st = itemState(c, it), fx = c.rd.fix[fixKey(it.k)]; return `<tr class="${st}"><td>${esc(txt(it.q, c))}</td><td>${esc(ansText(c, it))}${st === 'bad' ? ' ✗' : ''}${fx ? `<div class="fxp">Corrective action: ${esc(fx)}</div>` : ''}</td></tr>`; }).join('')}` : '';
-    }).join('');
-    const fer = rd.ferrules.length && groups(j, ri).some(g => g.items.some(i => i.t === 'ferrules')) ? `<p><b>Ferrule readings:</b> ${rd.ferrules.map(f => `${esc(f.loc || '?')} ${esc(f.ppm)} ppm`).join('; ')}</p>` : '';
-    const cfp = m === 'cf' ? `<table class="rep"><thead><tr><th>Point</th><th>Location</th><th>Readings</th><th>Stable in range</th><th>After hold</th><th>Final flush</th></tr></thead><tbody>${c.cfs.pts.map(p => { const s = c.cfs.per[p.id]; return `<tr><td>${esc(p.name)}</td><td>${esc(p.loc)}</td><td>${s.n}</td><td>${p.kind === 'inj' ? '' : s.stable ? 'Yes' : 'No'}</td><td>${s.lastHold ? esc(s.lastHold.ppm) + ' ppm' : ''}</td><td>${s.lastFlush ? esc(s.lastFlush.ppm) + ' ppm' : ''}</td></tr>`; }).join('')}</tbody></table><p class="small">${rd.cf.events.length} injection/flush start, change and stop entries. Full detail is on the Chlorine Verification Logs.</p>` : '';
-    const lb = j.labs.filter(l => l.ri === ri).map(l => { const e = labEval(j, l); return `<tr><td>${esc(mdy(l.date))}</td><td>${esc(l.point || '')}</td><td>${RULES.lab.map(p => `${p.name} ${esc(l[p.k] ?? '—')}`).join(', ')}</td><td>${e.pass === true ? 'Passed' : e.pass === false ? 'Failed: ' + esc(e.fails.join(', ')) : 'Incomplete'}</td></tr>`; }).join('');
-    return `<section class="rr"><h3>${roundName(ri)}: ${esc(methodLabel(m))}${ri ? ` · ${esc(RULES.fixes[rd.res.fix] || 'fix not recorded')}` : ''}</h3>
-${rows ? `<table class="rep">${rows}</table>` : '<p class="small">No steps answered.</p>'}${fer}${cfp}
-${lb ? `<h4>Lab results</h4><table class="rep"><thead><tr><th>Date</th><th>Point</th><th>Results</th><th>Outcome</th></tr></thead><tbody>${lb}</tbody></table>` : ''}</section>`;
-  }).join('');
-  return `<div class="sheet rep-sheet"><h1>Street report: ${esc(j.street)}</h1><p class="small">Printed ${esc(fmtDate(new Date()))}</p>
-<table class="rep kv">${F.map(([k, v]) => `<tr><th>${esc(k)}</th><td>${esc(v)}</td></tr>`).join('')}</table>${rounds}
-<section class="rr"><h3>Notes log</h3>${j.log.length ? `<ul class="nlog">${j.log.slice().sort((a, b) => a.t - b.t).map(n => noteEntry(j, n)).join('')}</ul>` : '<p class="small">No notes.</p>'}</section>${footer()}</div>`;
-}
-function formData(j, ri) {
-  const c = ctx(j, ri), rd = c.rd;
-  const failed = j.labs.filter(l => l.ri === ri - 1).flatMap(l => labEval(j, l).fails);
-  return { j, rd, ri, c, esc, mdy, mdyMs, hm, num, cfPoints: cfPoints(rd), cfs: c.cfs, prevLoaded: c.prevLoaded, evWhat: w => evWhat(rd, w), EV, PH,
-    labs: j.labs.filter(l => l.ri === ri).map(l => ({ l, e: labEval(j, l) })), failedTests: failed, fixes: RULES.fixes, round: roundName(ri) };
-}
-function printPage() {
-  const j = job(), k = V.kind, ri = V.ri ?? 0;
-  let html = '', back = j ? `#/job/${j.id}/print` : '#/analysis', title = '';
-  if (V.id === 'range') { const R = S.meta.range; title = 'Date-range report'; html = `<div class="sheet rep-sheet"><h1>Hinton Water: date-range report</h1>${rangeReportHtml(R.from, R.to)}${footer()}</div>`; }
-  else if (k === 'report') { title = `${j.street} street report`; html = streetReport(j); }
-  else if (j && j.rounds[ri]) {
-    const D = formData(j, ri);
-    if (k === 'initial') { title = 'Initial Sample Request'; html = FORMS.initial(D); }
-    else if (k === 'resample') { title = 'Resample Request'; html = FORMS.resample(D); }
-    else if (k === 'cfpre') { title = 'Disinfection Form (Pre)'; html = FORMS.cfForm(D, true); }
-    else if (k === 'cfpost') { title = 'Disinfection Form (Post)'; html = FORMS.cfForm(D, false); }
-    else if (k === 'cflog') { title = 'Chlorine Verification Logs'; html = FORMS.cfLogs(D); }
-  }
-  if (!html) return `<a class="back" href="#/">← All streets</a><p>Nothing to print.</p>`;
-  document.title = `${title}${j ? ` - ${j.street}` : ''}`;
-  return `<div class="ptools"><a class="back" href="${back}">← Back</a><button class="btn" data-act="print">Print / Save as PDF</button></div>${html}`;
-}
-
-/* --- settings / backup --- */
-async function settings() {
-  const lb = S.meta.lastBackup, pers = await Store.persisted(), undo = await Store.get('beforeRestore');
-  const notif = 'Notification' in self ? Notification.permission : 'unsupported';
-  return `<div class="top"><h2>Backup and settings</h2></div>
-<section class="card"><h3>Backup</h3><p>Everything is saved on this device only. A backup is one file with every street in it. Keep it in Google Drive, your Files app, or email it to yourself.</p>
-<p><b>Last backup:</b> ${lb ? esc(fmt(new Date(lb))) : 'never'}</p>
-<div class="btns"><button class="btn" data-act="backup">Back up</button><button class="btn ghost" data-act="restore">Restore from a backup file</button>${undo ? '<button class="btn ghost" data-act="undo">Undo last restore</button>' : ''}</div>
+/* ---------- home ---------- */
+let installEvt = null;
+const isIOS = () => /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const standalone = () => matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+let undoAvail = false;
+function home() {
+  const js = S.jobs, lb = S.meta.lastBackup, n = S.settings.recipients.length;
+  return `<div class="top"><h2>Streets <span class="mut" style="font-size:18px">${js.length}</span></h2><span class="mut">${js.length ? 'Tap a tab to open its folder' : ''}</span></div>
+${js.length ? `<div id="idx">${js.map((j, i) => { const L = 24 + (i % 8) * 5.5, dark = L < 48, [s, c] = status(j); return `<button class="tab" data-open="${j.id}" style="background:hsl(${206 - (i % 8) * 2} 78% ${L}%);color:${dark ? '#fff' : '#06203a'}"><span><span class="nm">${esc(j.street)}</span><small>${j.from || j.to ? esc(j.from) + ' to ' + esc(j.to) : '&nbsp;'}</small></span><span class="chip"><i class="${c}"></i>${s}</span></button>`; }).join('')}</div><div class="drawer"></div>`
+    : '<div class="empty">No streets yet. Add your first one below.</div>'}
+<form class="add" id="addf"><input id="a-st" placeholder="Street name" aria-label="Street name" required><input id="a-from" placeholder="From" aria-label="From"><input id="a-to" placeholder="To" aria-label="To"><button class="btn">Add street</button></form>
+<p class="sample">Your entries stay on this device.</p>
+<div class="tools"><button class="btn ghost" data-act="backup">Back up</button><button class="btn ghost" data-act="restore">Restore</button>${undoAvail ? '<button class="btn ghost" data-act="undo">Undo restore</button>' : ''}${installEvt ? '<button class="btn ghost" data-act="install">Install app</button>' : ''}
+<span class="sample" style="margin:0">Last backup: ${lb ? esc(fmt(new Date(lb))) : 'never'}</span>
 <input type="file" id="restore-file" accept=".json,application/json" hidden>
-<p class="sample">Restore replaces what’s on this device with the backup. You’ll be asked to confirm first, and you can undo it.</p></section>
-<section class="card"><h3>Email recipients</h3><p>The PWD list used on every street. Each street’s Email page can untick names or add more. The list is saved only on this device.</p>
-${S.settings.recipients.length ? '' : '<p class="sample"><b>The list is empty.</b> Paste the whole PWD list into the box below (commas, semicolons or spaces between addresses are all fine) and tap Add.</p>'}
-<div>${S.settings.recipients.map(e => `<div class="rcp"><span>${esc(e)}</span><button data-grcpdel="${esc(e)}" aria-label="Remove ${esc(e)}">Remove</button></div>`).join('')}</div>
-<form class="addrow" id="grcpf"><input id="grcp-new" type="text" inputmode="email" autocomplete="off" placeholder="Add an address, or paste a list" aria-label="Add an address, or paste a list"><button class="btn ghost">Add</button></form></section>
-${S.settings.tags.length ? `<section class="card"><h3>Your note tags</h3><p class="small mut">Tags you added. Removing one here keeps it on notes that already use it.</p><div>${S.settings.tags.map(t => `<div class="rcp"><span>${esc(t)}</span><button data-tagdel="${esc(t)}">Remove</button></div>`).join('')}</div></section>` : ''}
-<section class="card"><h3>Timer alerts</h3><p>Each timer has an <b>Add to calendar</b> button. That puts an alarm on your phone’s calendar, which goes off even with this app closed. That’s the reliable way.</p>
-<p>While the app is open it will also pop up and beep when a timer finishes.${notif === 'default' ? ' You can also let it show a notification while it’s open in the background:' : notif === 'granted' ? ' Notifications are on.' : notif === 'denied' ? ' Notifications are blocked in this browser’s settings.' : ''}</p>
-${notif === 'default' ? '<div class="btns"><button class="btn ghost" data-act="notif">Allow notifications</button></div>' : ''}
-<div class="btns"><button class="btn ghost sm" data-act="testbeep">Test the alert sound</button></div></section>
-<section class="card"><h3>About</h3><p>Hinton Water Disinfection Report, version ${esc(APP_VERSION)}.</p>
-<p class="small mut">Storage: ${pers ? 'protected (the browser won’t clear it to free space)' : 'standard. Installing the app to the home screen helps keep it safe.'}</p>
-<p class="small"><a href="#/help">How to use and install</a></p>
-<div class="btns" style="margin-top:18px"><button class="btn red sm" data-act="wipe">Erase everything on this device</button></div></section>${footer()}`;
+${isIOS() && !standalone() ? '<p class="sample" style="flex-basis:100%">To install on iPhone: tap Share, then Add to Home Screen.</p>' : ''}
+<details><summary>Email recipients (${n})</summary><p class="sample">The PWD list used on every street's Email page. Saved on this device only and included in backups. Paste the whole list; commas, semicolons or new lines between addresses are fine.</p><textarea id="rcp" data-rcp="1" aria-label="Email recipients">${esc(S.settings.recipients.join('\n'))}</textarea></details></div>`;
+}
+
+/* ---------- full analysis ---------- */
+function analysis() {
+  const D = S.jobs.filter(j => j.labs.length && labRes(j.labs[0], j, 0).pass !== null);
+  const first = j => labRes(j.labs[0], j, 0).pass, rate = a => (a.length ? Math.round(100 * a.filter(first).length / a.length) + '%' : '—');
+  const cold = D.filter(j => num(j.r.waterT) != null && +j.r.waterT < 41), warm = D.filter(j => num(j.r.waterT) != null && +j.r.waterT >= 41);
+  const gr = D.filter(j => j.r.granules === 'Y'), tb = D.filter(j => j.r.granules === 'N');
+  const cnt = {}; for (const j of S.jobs) j.labs.forEach((a, i) => labRes(a, j, i).fails.forEach(f => (cnt[f] = (cnt[f] || 0) + 1)));
+  const mx = Math.max(1, ...Object.values(cnt)), tries = D.length ? (D.reduce((s, j) => s + j.labs.length, 0) / D.length).toFixed(1) : '—';
+  return `<div class="top"><h2>What makes samples pass</h2><span class="mut">${D.length} streets with lab results</span></div>
+<div class="kpis"><div class="kpi"><strong>${rate(D)}</strong><span>Passed on the first sample</span></div><div class="kpi"><strong>${tries}</strong><span>Samples per main, on average</span></div><div class="kpi"><strong>${rate(cold)}</strong><span>First-try pass, water below 41°F (${cold.length})</span></div><div class="kpi"><strong>${rate(warm)}</strong><span>First-try pass, water 41°F and up (${warm.length})</span></div><div class="kpi"><strong>${rate(gr)}</strong><span>Tablets plus granules (${gr.length})</span></div><div class="kpi"><strong>${rate(tb)}</strong><span>Tablets only (${tb.length})</span></div></div>
+<h3 class="h3">Why samples failed</h3><div class="bars">${Object.keys(cnt).length ? Object.entries(cnt).sort((a, b) => b[1] - a[1]).map(([k, v]) => `<div class="bar"><span>${k}</span><div><i style="width:${100 * v / mx}%"></i></div><span>${v}</span></div>`).join('') : '<p class="mut">No failures logged yet.</p>'}</div>
+<h3 class="h3">Every main with results</h3>${D.length ? `<table class="stack"><thead><tr><th>Street</th><th>Water °F</th><th>Air °F</th><th>Granules</th><th>Samples</th><th>Result</th></tr></thead><tbody>${D.map(j => { const [s, c] = status(j); return `<tr><td><b>${esc(j.street)}</b></td><td>${esc(j.r.waterT)}</td><td>${esc(j.r.airT)}</td><td>${j.r.granules === 'Y' ? 'Yes' : j.r.granules === 'N' ? 'No' : ''}</td><td>${j.labs.length}</td><td><span class="b ${c}">${s}</span></td></tr>`; }).join('')}</tbody></table>` : '<p class="mut">Nothing yet.</p>'}
+<p class="sample">Fills in from your streets as lab results are entered.</p>`;
+}
+
+/* ---------- print / save ---------- */
+function printPage() {
+  const js = S.jobs, all = js.length && js.every(j => pick.ids.includes(j.id)), n = pick.ids.filter(id => js.some(j => j.id === id)).length + (pick.an ? 1 : 0);
+  return `<div class="top"><h2>Print or save</h2><span class="mut">Pick what to include</span></div>
+<div class="pick">${js.length ? `<label class="all"><input type="checkbox" data-pick="all"${all ? ' checked' : ''}> All streets (${js.length})</label>` : '<p class="mut">No streets yet.</p>'}
+${js.map(j => { const [s] = status(j); return `<label><input type="checkbox" data-pick="${j.id}"${pick.ids.includes(j.id) ? ' checked' : ''}><span><b>${esc(j.street)}</b> <small>${esc(j.from)} to ${esc(j.to)} · ${s}</small></span></label>`; }).join('')}
+<label class="all" style="margin-top:8px"><input type="checkbox" data-pick="an"${pick.an ? ' checked' : ''}> Full Analysis</label></div>
+<button class="btn" data-act="print"${n ? '' : ' disabled style="opacity:.5"'}>Print or save as PDF${n ? ` (${n})` : ''}</button>
+<p class="sample">This opens your device's print screen. To keep a file, choose <b>Save as PDF</b> (on iPhone, tap Share, then Save to Files). The PDF goes to your Downloads or Documents folder on this device. Nothing is sent anywhere.</p>`;
+}
+const ans = (j, it) => {
+  const v = get(j, it.k); if (!v) return '<span class="mut">—</span>';
+  if (it.t === 'yn') return v === 'Y' ? 'Yes' : 'No';
+  if (it.t === 'time') return esc(mdy(v));
+  return esc(v) + (it.u ? ' ' + it.u : '');
+};
+function streetDoc(j) {
+  const [s, c] = status(j), m = mailParts(j);
+  const info = FIELDS.slice(3).map(([k, l, t]) => `<tr><th style="width:38%">${l}</th><td>${esc(t === 'date' ? mdy(get(j, k)) : get(j, k)) || '<span class="mut">—</span>'}</td></tr>`).join('');
+  const steps = G.map(g => `<h3>${g.g}</h3><table><tbody>${g.items.map(it => it.t === 'calc' ? `<tr><td colspan="3">${calc(j)}</td></tr>` : `<tr><td>${esc(qText(it, j))}</td><td style="width:22%">${ans(j, it)}</td><td style="width:12%">${{ ok: '<span class="b ok">OK</span>', bad: '<span class="b bad">Flagged</span>' }[state(j, it)] || ''}</td></tr>`).join('')}</tbody></table>`).join('');
+  const labsH = j.labs.length ? j.labs.map((a, i) => { const r = labRes(a, j, i); return `<h3>${labName(i)} · ${esc(mdy(a.date)) || 'no date'} · ${r.pass === true ? '<span class="b ok">Passed</span>' : r.pass === false ? `<span class="b bad">Failed: ${esc(r.fails.join(', '))}</span>` : '<span class="b warn">Not complete</span>'}</h3>
+<table><thead><tr><th>Parameter</th><th>Acceptable</th><th>Result</th><th></th></tr></thead><tbody>${P.map(p => { const n = num(a[p[0]]), ok = n == null ? '' : p[4](n, j, i); return `<tr><td>${p[1]} <span class="mut">${p[2]}</span></td><td>${p[3](i)}</td><td>${esc(a[p[0]]) || '—'}</td><td>${ok === '' ? '' : ok ? '<span class="b ok">OK</span>' : '<span class="b bad">Fail</span>'}</td></tr>`; }).join('')}</tbody></table>`; }).join('') : '<p class="mut">No lab results yet.</p>';
+  return `<section class="doc"><h1>${esc(j.street)}</h1><p class="mut">${esc(j.from)} to ${esc(j.to)} · Work #${esc(j.f.work)} · <span class="b ${c}">${s}</span> · Printed ${esc(fmt(new Date()))}</p>
+<h2>Job info</h2><table><tbody>${info}</tbody></table>
+<h2>Steps</h2>${steps}
+<h2>Lab results</h2>${labsH}
+<h2>Email</h2><p><b>Subject:</b> ${esc(m.sub)}</p><pre>${esc(m.txt)}</pre>
+<h2>Notes</h2>${j.notes ? `<p class="notes">${esc(j.notes)}</p>` : '<p class="mut">None.</p>'}
+<h2>Analysis</h2>${jobAn(j)}</section>`;
+}
+function doPrint() {
+  const docs = S.jobs.filter(j => pick.ids.includes(j.id)).map(streetDoc);
+  if (pick.an) docs.push(`<section class="doc"><h1>Hinton Water: Analysis</h1><p class="mut">Printed ${esc(fmt(new Date()))}</p>${analysis()}</section>`);
+  if (!docs.length) return;
+  $('#print').innerHTML = `<table><tbody><tr><td>${docs.join('')}</td></tr></tbody><tfoot><tr><td></td></tr></tfoot></table><div class="pfoot">${FOOT.map(t => `<p>${esc(t)}</p>`).join('')}</div>`;
+  const sel = S.jobs.filter(j => pick.ids.includes(j.id));
+  const what = sel.length === 1 && !pick.an ? sel[0].street : sel.length === S.jobs.length && sel.length > 1 ? 'All streets' : sel.length ? `${sel.length} streets` : 'Analysis';
+  const whatAll = what + (pick.an && sel.length ? ' and Analysis' : '');
+  const old = document.title; document.title = `Hinton report - ${whatAll} - ${today()}`;
+  const done = () => { document.title = old; removeEventListener('afterprint', done); };
+  addEventListener('afterprint', done);
+  setTimeout(() => { window.print(); setTimeout(done, 1000); }, 50);
 }
 
 /* ---------- render ---------- */
-let ro = null;
+const app = $('#app'); let ro = null;
 function layoutTabs() {
-  const box = $('#idx'); if (!box) return;
-  const W = box.clientWidth, land = innerWidth > innerHeight && innerWidth >= 560;
-  const tw = Math.min(land ? Math.max(W * 0.5, 420) : W < 560 ? W * 0.8 : 340, W), max = W - tw;
-  const step = W < 560 ? 26 : 46, n = Math.max(1, Math.floor(max / step)), s = max / n;
-  box.style.setProperty('--tw', tw + 'px');
-  [...box.children].forEach((t, i) => { const k = i % (2 * n); t.style.marginLeft = (k <= n ? k : 2 * n - k) * s + 'px'; });
+  const box = $('#idx'); if (!box) return; const W = box.clientWidth, tw = Math.min(W < 560 ? W * 0.8 : 340, W), max = W - tw, step = W < 560 ? 26 : 46, n = Math.max(1, Math.floor(max / step)), s = max / n;
+  box.style.setProperty('--tw', tw + 'px'); [...box.children].forEach((t, i) => { const k = i % (2 * n); t.style.marginLeft = ((k <= n ? k : 2 * n - k) * s) + 'px'; });
 }
-async function render() {
-  const j = job();
-  if (V.page === 'job' && !j) V.page = 'home';
-  let html;
-  document.body.classList.toggle('printing', V.page === 'print');
-  if (V.page === 'job') html = detail(j);
-  else if (V.page === 'print') html = printPage();
-  else if (V.page === 'analysis') html = analysis();
-  else if (V.page === 'settings') html = await settings();
-  else if (V.page === 'help') html = `<a class="back" href="#/">← All streets</a>${howto(true)}`;
-  else html = home();
-  app.innerHTML = html;
-  for (const a of document.querySelectorAll('header nav a')) a.classList.toggle('on', a.dataset.nav === (V.page === 'job' || V.page === 'help' ? 'home' : V.page));
-  if (V.page !== 'print') document.title = V.page === 'job' && j ? `${j.street}: Hinton Water` : 'Hinton Water Disinfection Report';
-  labelStack();
-  if (ro) ro.disconnect();
-  const box = $('#idx'); if (box) { ro = new ResizeObserver(layoutTabs); ro.observe(box); layoutTabs(); }
-  tick();
+function render() {
+  const j = S.jobs.find(x => x.id === V.id); if (V.page === 'job' && !j) V.page = 'home';
+  app.innerHTML = V.page === 'job' ? detail(j) : V.page === 'analysis' ? analysis() + footer() : V.page === 'print' ? printPage() : home();
+  $('#nav-home').className = V.page === 'home' || V.page === 'job' ? 'on' : ''; $('#nav-an').className = V.page === 'analysis' ? 'on' : ''; $('#nav-pr').className = V.page === 'print' ? 'on' : '';
+  try { sessionStorage.setItem('hwdr-v', JSON.stringify(V)); } catch (e) {}
+  if (ro) ro.disconnect(); const box = $('#idx'); if (box) { ro = new ResizeObserver(layoutTabs); ro.observe(box); layoutTabs(); }
 }
-function rerender() {
-  setTimeout(async () => {
-    const a = document.activeElement, id = a && a.id, y = scrollY;
-    await render(); scrollTo(0, y);
-    if (id) { const e = document.getElementById(id); if (e) e.focus({ preventScroll: true }); }
-  }, 0);
-}
-function labelStack() {
-  for (const c of document.querySelectorAll('.stack td:not([data-l])')) { let i = 0, p = c; while ((p = p.previousElementSibling)) i += p.colSpan; c.dataset.l = c.closest('table').rows[0].cells[i]?.textContent || ''; }
-}
-addEventListener('resize', () => layoutTabs());
+function rerender() { setTimeout(() => { const a = document.activeElement, id = a && a.id, y = scrollY; render(); scrollTo(0, y); if (id) { const e = document.getElementById(id); if (e) e.focus({ preventScroll: true }); } }, 0); }
+/* Phone back button moves between screens instead of closing the app. */
+function go(nv) { Object.assign(V, nv); history.pushState({ ...V }, ''); scrollTo(0, 0); render(); }
+history.replaceState({ ...V }, '');
+addEventListener('popstate', e => { if (e.state) { Object.assign(V, e.state); render(); } });
+/* Fill in the column names for phone-width tables. */
+new MutationObserver(() => { for (const c of document.querySelectorAll('.stack td:not([data-l])')) { let i = 0, p = c; while ((p = p.previousElementSibling)) i += p.colSpan; c.dataset.l = c.closest('table').rows[0].cells[i]?.textContent || ''; } }).observe(document.body, { childList: true, subtree: true });
 
-/* ---------- timers: countdowns and alerts ---------- */
-function markOldAlerts() { for (const j of S.jobs) { const ri = cur(j); for (const id of timerIds(j, ri)) { const t = timer(j, ri, id); if (t.start && t.left < -2 * 6e4) S.meta.alerted[t.key] = 1; } } }
-markOldAlerts();
-function tick() {
-  const now = Date.now();
-  for (const el of document.querySelectorAll('[data-end]')) { const ms = +el.dataset.end - now; el.textContent = el.dataset.short ? leftShort(ms) : left(ms); }
-  let changed = false;
-  for (const j of S.jobs) {
-    const ri = cur(j);
-    for (const id of timerIds(j, ri)) {
-      const t = timer(j, ri, id);
-      if (t.start && t.left <= 0 && !S.meta.alerted[t.key]) { S.meta.alerted[t.key] = 1; changed = true; alarm(`${j.street}: ${t.name} is done`, t.d.doneMsg, j.id); }
-    }
-  }
-  if (changed) { save(); if (V.page !== 'print') rerender(); }
-}
-setInterval(tick, 1000);
-
-let actx = null;
-function unlockAudio() { try { actx ??= new (self.AudioContext || self.webkitAudioContext)(); if (actx.state === 'suspended') actx.resume(); } catch (e) {} }
-addEventListener('pointerdown', unlockAudio, { once: false, passive: true });
-function beep() {
-  try {
-    unlockAudio(); if (!actx) return;
-    const t0 = actx.currentTime;
-    for (let i = 0; i < 6; i++) {
-      const o = actx.createOscillator(), g = actx.createGain(); o.type = 'square'; o.frequency.value = i % 2 ? 880 : 1175;
-      g.gain.setValueAtTime(0.0001, t0 + i * 0.35); g.gain.exponentialRampToValueAtTime(0.25, t0 + i * 0.35 + 0.02); g.gain.exponentialRampToValueAtTime(0.0001, t0 + i * 0.35 + 0.3);
-      o.connect(g).connect(actx.destination); o.start(t0 + i * 0.35); o.stop(t0 + i * 0.35 + 0.32);
-    }
-  } catch (e) {}
-}
-function alarm(title, body, jobId) {
-  beep(); try { navigator.vibrate && navigator.vibrate([400, 200, 400, 200, 400]); } catch (e) {}
-  toast(title, body, true, jobId);
-  try {
-    if ('Notification' in self && Notification.permission === 'granted' && navigator.serviceWorker) navigator.serviceWorker.ready.then(r => r.showNotification(title, { body, tag: title, requireInteraction: true, icon: 'icons/icon-192.png', badge: 'icons/icon-192.png', data: { url: jobId ? `#/job/${jobId}/steps` : '#/' } }));
-  } catch (e) {}
-}
-function toast(title, body, alarmStyle, jobId) {
-  const box = $('#toasts'), el = document.createElement('div');
-  el.className = 'toast' + (alarmStyle ? ' alarm' : ''); el.setAttribute('role', alarmStyle ? 'alert' : 'status');
-  el.innerHTML = `<p><b>${esc(title)}</b>${esc(body || '')}</p>${jobId ? `<button data-open="${jobId}">Open</button>` : ''}<button data-x="1">OK</button>`;
-  box.appendChild(el);
-  el.addEventListener('click', e => { const b = e.target.closest('button'); if (!b) return; if (b.dataset.open) go(`#/job/${b.dataset.open}/steps`); el.remove(); });
-  if (!alarmStyle) setTimeout(() => el.remove(), 4000);
-}
-
-/* ---------- calendar ---------- */
-const icsDate = d => d.toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, '');
-const icsEsc = s => String(s).replace(/\\/g, '\\\\').replace(/;/g, '\\;').replace(/,/g, '\\,').replace(/\n/g, '\\n');
-function calText(j, t) { return { title: `${j.street}: ${t.name} done`, details: `${t.d.doneMsg}\n\n${j.street}${j.from ? ` (${j.from} to ${j.to || ''})` : ''}${j.f.work ? `, Work #${j.f.work}` : ''}. From the Hinton Water Disinfection Report app.` }; }
-function icsFor(j, t) {
-  const { title, details } = calText(j, t), end = new Date(t.end.getTime() + 15 * 6e4);
-  const alarms = [`BEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:${icsEsc(title)}\r\nTRIGGER:PT0M\r\nEND:VALARM`];
-  if (t.hours >= 2) alarms.push(`BEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:${icsEsc(title + ' in 30 minutes')}\r\nTRIGGER:-PT30M\r\nEND:VALARM`);
-  return ['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//Hinton Water Disinfection Report//EN', 'CALSCALE:GREGORIAN', 'METHOD:PUBLISH', 'BEGIN:VEVENT',
-    `UID:${t.key.replace(/\|/g, '-')}@hinton-water`, `DTSTAMP:${icsDate(new Date())}`, `DTSTART:${icsDate(t.end)}`, `DTEND:${icsDate(end)}`,
-    `SUMMARY:${icsEsc(title)}`, `DESCRIPTION:${icsEsc(details)}`, ...alarms, 'END:VEVENT', 'END:VCALENDAR'].join('\r\n');
-}
-function gcalUrl(j, t) {
-  const { title, details } = calText(j, t);
-  return `https://calendar.google.com/calendar/render?action=TEMPLATE&text=${encodeURIComponent(title)}&dates=${icsDate(t.end)}/${icsDate(new Date(t.end.getTime() + 15 * 6e4))}&details=${encodeURIComponent(details)}`;
-}
-const isIOS = () => /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
-function saveFile(name, text, type) {
-  const blob = new Blob([text], { type });
-  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name;
-  document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 60000);
-}
-function addToCalendar(j, id) {
-  const t = timer(j, cur(j), id); if (!t.start) return;
-  const ics = icsFor(j, t), name = `${j.street} ${t.name}`.replace(/[^\w -]+/g, '').trim() + '.ics';
-  if (isIOS()) { location.href = 'data:text/calendar;charset=utf-8,' + encodeURIComponent(ics); return; }
-  saveFile(name, ics, 'text/calendar');
-  toast('Calendar file saved', 'Open it to add the alarm to your calendar. On Android, if it won’t open, use “Google Calendar instead”.');
-}
+let toastT;
+function toast(msg) { const t = $('#toast'); t.textContent = msg; t.hidden = false; clearTimeout(toastT); toastT = setTimeout(() => (t.hidden = true), 3500); }
 
 /* ---------- backup / restore ---------- */
+function saveFile(name, text, type) {
+  const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([text], { type })); a.download = name;
+  document.body.appendChild(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+}
 async function backup() {
   await flush();
   const data = JSON.stringify({ app: 'hinton-water-disinfection-report', version: APP_VERSION, exported: new Date().toISOString(), streets: S.jobs.length, state: S }, null, 1);
   const name = `Hinton backup ${today()}.json`;
   const file = typeof File === 'function' ? new File([data], name, { type: 'application/json' }) : null;
-  const mobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || isIOS();
-  if (mobile && file && navigator.canShare && navigator.canShare({ files: [file] })) {
-    try { await navigator.share({ files: [file], title: name }); done(); return; }
-    catch (e) { if (e && e.name === 'AbortError') return; }
+  const done = () => { S.meta.lastBackup = Date.now(); save(); toast(`Backup saved: ${name}`); render(); };
+  if ((/Android/i.test(navigator.userAgent) || isIOS()) && file && navigator.canShare && navigator.canShare({ files: [file] })) {
+    try { await navigator.share({ files: [file], title: name }); done(); return; } catch (e) { if (e && e.name === 'AbortError') return; }
   }
   saveFile(name, data, 'application/json'); done();
-  function done() { S.meta.lastBackup = Date.now(); save(); toast('Backup saved', `${name}: ${S.jobs.length} street${S.jobs.length === 1 ? '' : 's'}.`); rerender(); }
 }
 async function restoreFrom(file) {
-  let d; try { d = JSON.parse(await file.text()); } catch (e) { toast('That file can’t be read', 'Pick a backup file made by this app (it ends in .json).', true); return; }
-  if (!d || d.app !== 'hinton-water-disinfection-report' || !d.state || !Array.isArray(d.state.jobs)) { toast('Not a backup file', 'That file wasn’t made by this app’s Back up button.', true); return; }
+  let d; try { d = JSON.parse(await file.text()); } catch (e) { toast('That file can’t be read. Pick a backup file made by this app.'); return; }
+  if (!d || d.app !== 'hinton-water-disinfection-report' || !d.state || !Array.isArray(d.state.jobs)) { toast('That isn’t a backup file from this app.'); return; }
+  const ns = d.state.v === 3 ? fixup(d.state) : fixup(fromV1(d.state));
   const when = d.exported ? fmt(new Date(d.exported)) : 'an unknown date';
-  if (!confirm(`Restore the backup from ${when}?\n\nIt has ${d.state.jobs.length} street(s). It will replace the ${S.jobs.length} street(s) on this device. You can undo this afterward.`)) return;
-  await Store.put('beforeRestore', S);
-  S = d.state; fixup(S); S.meta.lastBackup = Date.now(); markOldAlerts(); await flush();
-  toast('Backup restored', `${S.jobs.length} street(s) loaded.`); go('#/');
+  if (!confirm(`Restore the backup from ${when}?\n\nIt has ${ns.jobs.length} street(s). It replaces the ${S.jobs.length} street(s) on this device. You can undo this afterward.`)) return;
+  await Store.put('beforeRestore3', S); undoAvail = true;
+  S = ns; S.meta.lastBackup = Date.now(); await flush();
+  toast(`Backup restored: ${S.jobs.length} street(s).`); go({ page: 'home' });
 }
-
-/* ---------- copy ---------- */
-async function copy(text, btn) {
-  const old = btn.textContent;
-  try { await navigator.clipboard.writeText(text); btn.textContent = 'Copied ✓'; }
-  catch (e) { const ta = document.createElement('textarea'); ta.value = text; document.body.appendChild(ta); ta.select(); try { document.execCommand('copy'); btn.textContent = 'Copied ✓'; } catch (e2) { btn.textContent = 'Copy failed'; } ta.remove(); }
-  setTimeout(() => { btn.textContent = old; }, 1500);
-}
+undoAvail = !!(await Store.get('beforeRestore3'));
 
 /* ---------- events ---------- */
-function onSel(j, p, v) {
-  const m = p.match(/^rounds\.(\d+)\.method$/);
-  if (m && v === 'cf') {
-    const ri = +m[1], rd = j.rounds[ri];
-    if (!rd.cf.reason) rd.cf.reason = ri === 0 ? 'init' : j.labs.filter(l => l.ri === ri - 1).some(l => labEval(j, l).fails.some(f => RULES.bacterial.includes(f))) ? 'bact' : 'other';
-    if (!rd.cf.flush.length) rd.cf.flush.push({ id: uid(), loc: '', dia: '', rate: '' });
-  }
+const cur = () => S.jobs.find(x => x.id === V.id);
+async function copyText(id, b) {
+  const t = document.getElementById(id).textContent, old = b.textContent;
+  try { await navigator.clipboard.writeText(t); b.textContent = 'Copied'; }
+  catch (e) { const r = document.createRange(); r.selectNodeContents(document.getElementById(id)); getSelection().removeAllRanges(); getSelection().addRange(r); b.textContent = 'Selected, now copy'; }
+  setTimeout(() => (b.textContent = old), 1500);
 }
 document.addEventListener('click', async e => {
-  const fl = e.target.closest('[data-focus]');
-  if (fl) { const f = fl.dataset.focus; setTimeout(() => { const el = document.getElementById('f-' + f.replace(/\./g, '-')); if (el) { el.scrollIntoView({ block: 'center' }); el.focus(); } }, 80); return; }
-  const b = e.target.closest('button'); if (!b || b.closest('.toast')) return;
-  const d = b.dataset, j = job();
-  const ri = j ? (V.ri != null && j.rounds[V.ri] ? V.ri : cur(j)) : 0;
-  if (d.yn && j) { setP(j, d.yn, getP(j, d.yn) === d.v ? '' : d.v); save(); rerender(); }
-  else if (d.sel && j) { const was = getP(j, d.sel); setP(j, d.sel, was === d.v && !/\.method$/.test(d.sel) ? '' : d.v); onSel(j, d.sel, d.v); save(); rerender(); }
-  else if (d.now && j) { setP(j, d.now, isoLocal(new Date())); save(); rerender(); }
-  else if (d.tstart && j) { setP(j.rounds[cur(j)], RULES.timers[d.tstart].from, isoLocal(new Date())); save(); rerender(); }
-  else if (d.tclear && j) { setP(j.rounds[cur(j)], RULES.timers[d.tclear].from, ''); save(); rerender(); }
-  else if (d.ics && j) addToCalendar(j, d.ics);
-  else if (d.feradd && j) { j.rounds[ri].ferrules.push({ loc: '', ppm: '' }); save(); render().then(() => { const el = document.getElementById(`fr-${ri}-${j.rounds[ri].ferrules.length - 1}-l`); el && el.focus(); }); }
-  else if (d.ferdel && j) { j.rounds[ri].ferrules.splice(+d.ferdel, 1); save(); rerender(); }
-  else if (d.ptadd && j) { const cf = j.rounds[ri].cf, L = d.ptadd === 'flush' ? cf.flush : cf.ver; L.push(d.ptadd === 'flush' ? { id: uid(), loc: '', dia: '', rate: '' } : { id: uid(), loc: '' }); save(); render().then(() => { const el = document.getElementById(`p${d.ptadd === 'flush' ? 'f' : 'v'}-${L.length - 1}-l`); el && el.focus(); }); }
-  else if (d.ptdel && j) { const [k, i] = d.ptdel.split('|'), cf = j.rounds[ri].cf; (k === 'flush' ? cf.flush : cf.ver).splice(+i, 1); save(); rerender(); }
-  else if (d.phase && j) { j.rounds[ri].cf.phase = d.phase; save(); rerender(); }
-  else if (d.ev && j) {
-    const rd = j.rounds[cur(j)], what = $('#ev-what').value, rate = $('#ev-rate').value.trim(), now = new Date();
-    rd.cf.events.push({ t: now.getTime(), what, act: d.ev, rate });
-    if (what === 'inj' && d.ev === 'start' && !rd.t.loaded) rd.t.loaded = isoLocal(now);
-    if (what === 'inj' && d.ev === 'stop' && !rd.t.holdStart) { rd.t.holdStart = isoLocal(now); if (!rd.cf.phase || rd.cf.phase === 'feed') rd.cf.phase = 'hold'; }
-    if (what !== 'inj' && d.ev === 'start' && rd.t.holdStart && !rd.t.flushStart) { rd.t.flushStart = isoLocal(now); rd.cf.phase = 'flush'; }
-    toast(`${evWhat(rd, what)}: ${EV[d.ev]}`, `Logged at ${hm(now.getTime())}.`);
-    save(); rerender();
-  }
-  else if (d.void && j) {
-    if (b.dataset.armed) { const [r, p, i] = d.void.split('|'); const x = j.rounds[+r].cf.logs[p][+i]; x.void = true; x.voidAt = Date.now(); save(); rerender(); }
-    else { b.dataset.armed = 1; b.textContent = 'Tap again'; }
-  }
-  else if (d.addlab && j) { const r = cur(j); j.labs.push({ id: uid(), ri: r, date: today(), point: '' }); save(); await render(); const el = document.getElementById(`l${j.labs.length - 1}-free`); el && el.scrollIntoView({ block: 'center' }); }
-  else if (d.labdel && j) { if (b.dataset.armed) { j.labs.splice(+d.labdel, 1); save(); rerender(); } else { b.dataset.armed = 1; b.textContent = 'Tap again to delete'; } }
-  else if (d.del && j) { if (b.dataset.armed) { S.jobs = S.jobs.filter(x => x !== j); save(); go('#/'); } else { b.dataset.armed = 1; b.textContent = 'Tap again to delete this street for good'; } }
-  else if (d.rcpdel && j) { j.mail.extra = j.mail.extra.filter(x => x !== d.rcpdel); save(); rerender(); }
-  else if (d.grcpdel) { S.settings.recipients = S.settings.recipients.filter(x => x !== d.grcpdel); save(); rerender(); }
-  else if (d.tagdel) { S.settings.tags = S.settings.tags.filter(x => x !== d.tagdel); save(); rerender(); }
-  else if (d.copy && j) { const m = mailParts(j); copy(d.copy === 'to' ? m.to.join('; ') : d.copy === 'subject' ? m.subject : d.copy === 'body' ? m.text : `To: ${m.to.join('; ')}\n\nSubject: ${m.subject}\n\n${m.text}`, b); }
-  else if (d.act === 'resample' && j) { j.rounds.push(newRound('resample')); save(); go(`#/job/${j.id}/steps`); }
-  else if (d.act === 'unmethod' && j) { if (confirm('Pick the method again? Answers already entered are kept.')) { j.rounds[0].method = null; save(); rerender(); } }
-  else if (d.act === 'print') window.print();
+  const b = e.target.closest('button'); if (!b) return; const d = b.dataset;
+  if (d.go) go({ page: d.go });
+  else if (d.open) go({ page: 'job', id: d.open, sec: 'info' });
+  else if (d.sec) { V.sec = d.sec; history.replaceState({ ...V }, ''); render(); }
+  else if (d.yn) { const j = cur(); set(j, d.yn, get(j, d.yn) === d.v ? '' : d.v); save(); rerender(); }
+  else if (d.addlab) { const j = cur(); j.labs.push(lab(today())); save(); render(); }
+  else if (d.del) { if (b.dataset.armed) { S.jobs = S.jobs.filter(x => x.id !== d.del); pick.ids = pick.ids.filter(x => x !== d.del); save(); go({ page: 'home' }); } else { b.dataset.armed = '1'; b.textContent = 'Tap again to delete for good'; } }
+  else if (d.copy) copyText(d.copy, b);
   else if (d.act === 'backup') backup();
-  else if (d.act === 'snooze') { S.meta.snoozed = Date.now(); save(); rerender(); }
   else if (d.act === 'restore') $('#restore-file').click();
-  else if (d.act === 'undo') { const u = await Store.get('beforeRestore'); if (u && confirm('Put back the data you had before the last restore?')) { await Store.put('beforeRestore', null); S = u; fixup(S); await flush(); toast('Restore undone', ''); go('#/'); } }
-  else if (d.act === 'notif') { try { await Notification.requestPermission(); } catch (e2) {} rerender(); }
-  else if (d.act === 'testbeep') { beep(); try { navigator.vibrate && navigator.vibrate(300); } catch (e2) {} }
-  else if (d.act === 'wipe') { if (confirm('Erase every street on this device? Make a backup first if you might want it.') && confirm('Are you sure? This can’t be undone.')) { S = blankState(); await flush(); go('#/'); } }
+  else if (d.act === 'undo') { const u = await Store.get('beforeRestore3'); if (u && confirm('Put back the data you had before the last restore?')) { await Store.put('beforeRestore3', null); undoAvail = false; S = fixup(u); await flush(); toast('Restore undone.'); go({ page: 'home' }); } }
+  else if (d.act === 'install' && installEvt) { installEvt.prompt(); try { await installEvt.userChoice; } catch (x) {} installEvt = null; render(); }
+  else if (d.act === 'print') doPrint();
   else if (d.act === 'update') { const w = window.__waiting; if (w) w.postMessage('skip'); else location.reload(); }
 });
 document.addEventListener('change', e => {
-  const t = e.target;
+  const t = e.target, d = t.dataset;
   if (t.id === 'restore-file') { const f = t.files && t.files[0]; t.value = ''; if (f) restoreFrom(f); return; }
-  if (t.dataset.mk) { setP(S.meta, t.dataset.mk, t.value); save(); rerender(); return; }
-  const j = job();
-  if (t.dataset.rcp && j) { const em = t.dataset.rcp; j.mail.off = t.checked ? j.mail.off.filter(x => x !== em) : [...new Set([...j.mail.off, em])]; save(); rerender(); return; }
-  const k = t.dataset.k; if (!k || !j) return;
-  setP(j, k, t.tagName === 'TEXTAREA' ? t.value : t.value.trim()); save(); rerender();
+  if (d.pick) {
+    if (d.pick === 'all') pick.ids = t.checked ? S.jobs.map(j => j.id) : [];
+    else if (d.pick === 'an') pick.an = t.checked;
+    else pick.ids = t.checked ? [...new Set([...pick.ids, d.pick])] : pick.ids.filter(x => x !== d.pick);
+    render(); return;
+  }
+  if (d.rcp) { S.settings.recipients = [...new Set((t.value.match(/[^\s,;<>"']+@[^\s,;<>"']+/g) || []))]; save(); render(); return; }
+  const j = cur(); if (!j) return;
+  if (d.req) { j.mailReq = t.value; save(); rerender(); return; }
+  if (!d.k) return;
+  set(j, d.k, t.value.trim()); save(); rerender();
 });
-document.addEventListener('input', e => { const t = e.target, j = job(); if (t.tagName === 'TEXTAREA' && t.dataset.k && j) { setP(j, t.dataset.k, t.value); save(); } });
 document.addEventListener('submit', e => {
-  e.preventDefault(); const f = e.target, v = id => ($('#' + id)?.value || '').trim(), j = job();
-  if (f.id === 'addf') {
-    if (!v('a-st')) return;
-    const nj = newJob(v('a-st'), v('a-from'), v('a-to')); S.jobs.push(nj); S.meta.firstData ??= Date.now(); save(); go(`#/job/${nj.id}/info`);
-  } else if (f.id === 'rcpf') { const em = v('rcp-new'); if (em && j && /.+@.+\..+/.test(em)) { j.mail.extra = [...new Set([...j.mail.extra, em])]; j.mail.off = j.mail.off.filter(x => x !== em); save(); rerender(); } }
-  else if (f.id === 'grcpf') {
-    const ems = v('grcp-new').split(/[\s,;]+/).map(x => x.replace(/^<|>$/g, '')).filter(x => /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(x));
-    if (ems.length) { S.settings.recipients = [...new Set([...S.settings.recipients, ...ems])]; save(); rerender(); }
-  }
-  else if (f.id === 'notef' && j) {
-    const text = $('#n-text').value.trim(); if (!text) return;
-    const tags = [...f.querySelectorAll('input[name=tag]:checked')].map(x => x.value), nt = v('n-newtag');
-    if (nt) { tags.push(nt); if (!RULES.tags.includes(nt)) S.settings.tags = [...new Set([...S.settings.tags, nt])]; }
-    j.log.push({ id: uid(), t: Date.now(), ri: cur(j), stage: v('n-stage'), tags: [...new Set(tags)], text });
-    save(); rerender(); toast('Note added', '');
-  }
-  else if (f.dataset.pt && j) {
-    const ri = +f.dataset.ri, rd = j.rounds[ri], pt = f.dataset.pt, ppm = num(v(`rd-${pt}`));
-    if (ppm === null) return;
-    const now = new Date();
-    (rd.cf.logs[pt] ??= []).push({ t: now.getTime(), ppm, ph: cfStatus(rd).phase, note: v(`rn-${pt}`) });
-    rd.cf.lastRead = isoLocal(now);
-    save(); rerender();
-  }
+  if (e.target.id !== 'addf') return; e.preventDefault(); const v = id => document.getElementById(id).value.trim(); if (!v('a-st')) return;
+  const j = mk(v('a-st'), v('a-from'), v('a-to')); S.jobs.push(j); save(); go({ page: 'job', id: j.id, sec: 'info' });
 });
-addEventListener('focus', () => { if (V.page === 'home') rerender(); });
-document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') tick(); });
+setInterval(() => { if (V.page === 'job' && (V.sec === 'steps' || V.sec === 'an') && !(document.activeElement && document.activeElement.dataset && document.activeElement.dataset.k)) rerender(); }, 60000);
+addEventListener('beforeinstallprompt', e => { e.preventDefault(); installEvt = e; if (V.page === 'home') render(); });
+render();
 
 /* ---------- offline + updates ---------- */
 if ('serviceWorker' in navigator && location.protocol !== 'file:') {
   navigator.serviceWorker.register('sw.js').then(reg => {
-    const offer = w => { window.__waiting = w; const bar = $('#update'); bar.hidden = false; };
+    const offer = w => { window.__waiting = w; $('#update').hidden = false; };
     if (reg.waiting && navigator.serviceWorker.controller) offer(reg.waiting);
     reg.addEventListener('updatefound', () => { const w = reg.installing; w && w.addEventListener('statechange', () => { if (w.state === 'installed' && navigator.serviceWorker.controller) offer(w); }); });
     setInterval(() => reg.update().catch(() => {}), 60 * 60 * 1000);
@@ -876,6 +446,4 @@ if ('serviceWorker' in navigator && location.protocol !== 'file:') {
   let reloaded = false;
   navigator.serviceWorker.addEventListener('controllerchange', () => { if (!reloaded) { reloaded = true; flush().finally(() => location.reload()); } });
 }
-
-route(); render();
 })();

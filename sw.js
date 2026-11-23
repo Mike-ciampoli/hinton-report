@@ -3,11 +3,11 @@
    CORE files must all download or the update is skipped (the old copy keeps
    working). EXTRA files (fonts, icons) are saved when they can be; if one is
    missing the app still works offline with the phone's own fonts. */
-const VERSION = '1.1.0';
+const VERSION = '2.0.0';
 const CACHE = 'hinton-water-' + VERSION;
 const CORE = [
   './', 'index.html', 'manifest.webmanifest',
-  'css/app.css', 'js/version.js', 'js/rules.js', 'js/forms.js', 'js/store.js', 'js/app.js'
+  'css/app.css', 'js/version.js', 'js/store.js', 'js/app.js'
 ];
 const EXTRA = [
   'icons/icon-192.png', 'icons/icon-512.png', 'icons/icon-maskable-512.png', 'icons/apple-touch-icon.png', 'icons/favicon.png',
@@ -39,11 +39,3 @@ self.addEventListener('fetch', e => {
   e.respondWith(caches.match(req, { ignoreSearch: true }).then(r => r || fetch(req).catch(() => new Response('', { status: 404, statusText: 'offline' }))));
 });
 
-self.addEventListener('notificationclick', e => {
-  e.notification.close();
-  const url = (e.notification.data && e.notification.data.url) || '#/';
-  e.waitUntil(self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(cs => {
-    for (const c of cs) if ('focus' in c) return c.focus();
-    return self.clients.openWindow('./' + url);
-  }));
-});
